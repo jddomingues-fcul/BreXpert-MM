@@ -4,6 +4,8 @@ BreXpert-MM is a license-aware reconstruction pipeline for a multimodal breast i
 
 This repository does not redistribute upstream images, metadata, processed arrays, aggregate CSVs, or VQA files. It is a workflow that rebuilds those artifacts locally from sources you obtain and are authorised to use. The result is intended for research on multimodal breast imaging representation learning, report generation, and VQA — not for clinical diagnosis, triage, or any deployment without separate regulatory, safety, and domain-expert review.
 
+[![DOI](https://zenodo.org/badge/1273904869.svg)](https://doi.org/10.5281/zenodo.20763147)
+
 ## Requirements
 
 - Python 3.12 (pinned in `.python-version`)
