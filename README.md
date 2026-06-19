@@ -75,7 +75,7 @@ This produces JSONL dialogue files under `../data/robust_vqa_split/`. The robust
 
 ### 6. Record what you built
 
-After a build, fill in [`manifest.yaml`](manifest.yaml) — `pipeline.git_commit` (the commit you ran) and each source's `version`/`version_evidence` (the exact upstream release you downloaded). Always pair reported results with this file: results from different manifests are not directly comparable.
+After a build, fill in [`data_manifest.yaml`](data_manifest.yaml) — `pipeline.git_commit` (the commit you ran) and each source's `version`/`version_evidence` (the exact upstream release you downloaded). Always pair reported results with this file: results from different manifests are not directly comparable.
 
 ## Using the dataset
 
@@ -111,7 +111,7 @@ Where things end up:
 
 ## Licensing and source terms
 
-Code and documentation in this repository are MIT-licensed (see [LICENSE](LICENSE)). That license covers the pipeline only — it does not relicense, override, or extend to any upstream images, metadata, annotations, or files you generate from those sources. Each source keeps its own license and access terms (recorded per source in [manifest.yaml](manifest.yaml)); verify current terms before downloading, since they can change. Keep sources with incompatible terms in separate reconstructions, and do not publish derived artifacts unless every included source permits that exact release.
+Code and documentation in this repository are MIT-licensed (see [LICENSE](LICENSE)). That license covers the pipeline only — it does not relicense, override, or extend to any upstream images, metadata, annotations, or files you generate from those sources. Each source keeps its own license and access terms (recorded per source in [data_manifest.yaml](data_manifest.yaml)); verify current terms before downloading, since they can change. Keep sources with incompatible terms in separate reconstructions, and do not publish derived artifacts unless every included source permits that exact release.
 
 ## Known limitations
 
@@ -122,4 +122,4 @@ Code and documentation in this repository are MIT-licensed (see [LICENSE](LICENS
 
 - Install the pre-commit hooks before your first commit: `pre-commit install`. They run `black`, `flake8`, and basic YAML/TOML/JSON/whitespace checks.
 - To add a new source, create an adapter in `preprocessing/` implementing `BreastCancerDataset` (see [dtos/breast_cancer_dataset.py](dtos/breast_cancer_dataset.py)), register it in `scripts/preprocess.py`'s `dataset_mapping`, and add it to the staging table above.
-- Keep changes scoped and update `README.md`/`manifest.yaml` when behavior or source versions change.
+- Keep changes scoped and update `README.md`/`data_manifest.yaml` when behavior or source versions change.
