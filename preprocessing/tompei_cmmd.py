@@ -189,13 +189,12 @@ class TompeiCMMD(BreastCancerDataset):
         self.clinical_data = self.clinical_data[self.clinical_data["n_images"] == 2]
 
         # Process the exams
-        n = max(1, min(cpu_count() - 1, len(self.clinical_data)))
+        n = cpu_count() - 1
         df_split = [
             self.clinical_data.iloc[idx]
             for idx in np.array_split(np.arange(len(self.clinical_data)), n)
             if len(idx) > 0
         ]
-
         with Pool(processes=n) as p:
             results = p.map(self.process_small_batch, df_split)
 

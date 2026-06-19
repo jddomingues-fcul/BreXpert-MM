@@ -107,7 +107,12 @@ class BreastMicroCalc(BreastCancerDataset):
 
         # Process the exams
         n = cpu_count() - 1
-        df_split = np.array_split(breast_micro_calc, n)
+        df_split = [
+            breast_micro_calc.iloc[idx]
+            for idx in np.array_split(np.arange(len(breast_micro_calc)), n)
+            if len(idx) > 0
+        ]
+
         with Pool(processes=n) as p:
             results = p.map(self.process_small_batch, df_split)
 

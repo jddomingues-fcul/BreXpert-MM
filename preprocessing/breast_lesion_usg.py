@@ -90,7 +90,12 @@ class BreastLesionUSG(BreastCancerDataset):
 
         # Process the exams
         n = cpu_count() - 1
-        df_split = np.array_split(self.lesions_usg_df, n)
+        df_split = [
+            self.lesions_usg_df.iloc[idx]
+            for idx in np.array_split(np.arange(len(self.lesions_usg_df)), n)
+            if len(idx) > 0
+        ]
+
         with Pool(processes=n) as p:
             results = p.map(self.process_small_batch, df_split)
 
