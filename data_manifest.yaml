@@ -4,7 +4,7 @@
 # Include this file whenever reporting results from this dataset.
 
 pipeline:
-  git_commit: 9afcded3174d73bd26db2aa08465dd709af69a4a
+  git_commit: 6afdfebdd1c4669ed1f2c386ae6c82e8ba1061b3
   robust_vqa: true
 
 sources:
