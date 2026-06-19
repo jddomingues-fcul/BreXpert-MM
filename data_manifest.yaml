@@ -1,0 +1,58 @@
+# BreXpert-MM Reconstruction Manifest
+
+# Update `pipeline.git_commit` and each source's `version` / `version_evidence` whenever you rebuild the dataset or re-pull a source.
+# Include this file whenever reporting results from this dataset.
+
+pipeline:
+  git_commit: 9afcded3174d73bd26db2aa08465dd709af69a4a
+  robust_vqa: true
+
+sources:
+- slug: advanced-mri-lesions
+  download_url: https://www.cancerimagingarchive.net/collection/advanced-mri-breast-lesions/
+  license: CC BY 4.0
+  version: Version 2 - Updated 2024/04/15
+- slug: breast-lesions-usg
+  download_url: https://www.cancerimagingarchive.net/collection/breast-lesions-usg/
+  license: CC BY 4.0
+  version: Version 1 - Updated 2024/01/08
+- slug: breast-micro-calc
+  download_url: https://zenodo.org/records/5036062
+  license: CC BY 4.0
+  version: Verson 2 - Updated 2021/06/30
+- slug: bus-bra
+  download_url: https://zenodo.org/records/8231412
+  license: CC BY 4.0
+  version: Version 1 - Updated 2023/03/13
+- slug: cbis-ddsm
+  download_url: https://www.cancerimagingarchive.net/collection/cbis-ddsm/
+  license: CC BY 3.0
+  version: Version 1 - Updated 2017/09/14
+- slug: embed
+  download_url: https://github.com/Emory-HITI/EMBED_Open_Data
+  license: EMBED Research Use Agreement (non-commercial, research purposes only)
+  version: Version 1 - Updated 2024/03/01
+- slug: inbreast
+  download_url: https://www.kaggle.com/datasets/martholi/inbreast
+  license: unknown
+  version: Version 1 - Updated 2020/04/18
+- slug: la-breast
+  download_url: https://data.mendeley.com/datasets/8rzyn3ng9c/1
+  license: CC BY 4.0
+  version: Version 1 - Updated 2024/06/07
+- slug: mama-mia
+  download_url: https://www.synapse.org/Synapse:syn60868042/wiki/628716
+  license: CC BY 3.0/4.0, CC BY-NC 4.0
+  version: Version 1 - Updated on 2025/2/24
+- slug: oasbud
+  download_url: https://zenodo.org/records/545928
+  license: CC BY-NC 4.0
+  version: Version 1 - Updated 2017/08/31
+- slug: rsna-bcd
+  download_url: https://registry.opendata.aws/rsna-screening-mammography-breast-cancer-detection/
+  license: non-commercial
+  version: Version 1 - Updated 2023/02/27
+- slug: tompei-cmmd
+  download_url: https://www.cancerimagingarchive.net/analysis-result/tompei-cmmd/
+  license: CC BY 4.0
+  version: Version 1 - Updated 2025/01/24
