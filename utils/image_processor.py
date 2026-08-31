@@ -1,23 +1,29 @@
 import logging
 import os
-from typing import Optional
 
 import numpy as np
 
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from utils.error_handling import log_func_info, trycatch_func
+from utils.preprocessing import binarize_mask
 
 
 class ImageProcessor:
+    """Read -> process -> save, for one modality's images and masks.
+
+    Every public method is wrapped in `trycatch_func`, so a failure anywhere
+    below surfaces as `None` with the cause logged. Callers only need to check
+    for `None`.
+    """
+
     IMGS_SUFFIX = "_imgs"
     SEGMENTATION_SUFFIX = "_segmentation"
-    SLICES_SUFFIX = "_slices"
 
     def __init__(
-        self,
-        raw_imgs_path: str,
-        processed_imgs_path: str,
-        image_preprocessing_config: ImagePreprocessingConfig,
+            self,
+            raw_imgs_path: str,
+            processed_imgs_path: str,
+            image_preprocessing_config: ImagePreprocessingConfig,
     ):
         self.raw_imgs_path = raw_imgs_path
         self.processed_imgs_path = processed_imgs_path
@@ -26,120 +32,94 @@ class ImageProcessor:
         self.pipeline = image_preprocessing_config.processing_pipeline
         self.segmentation_pipeline = image_preprocessing_config.segmentation_pipeline
 
-        # Create the processed imgs folder
         os.makedirs(self.processed_imgs_path, exist_ok=True)
+
+    def _save_path(self, exam_id: str, patient_id: str, suffix: str) -> str:
+        return os.path.join(self.processed_imgs_path, f"{patient_id}-{exam_id}{suffix}")
 
     @trycatch_func
     @log_func_info
     def read_image(self, img_path: str):
-        assert os.path.exists(img_path), f"Image {img_path} not found"
-        res = None
-
-        try:
-            res = self.read_process(img_path)
-        except Exception as e:
-            logging.error(f"Error reading the image {img_path}: {e}")
-
-        return res
+        return self.read_process(img_path)
 
     @trycatch_func
     @log_func_info
     def apply_processing(self, img: np.ndarray, is_segmentation: bool = False):
-        res = img
-        try:
-            if is_segmentation:
-                for processing_step in self.segmentation_pipeline:
-                    res = processing_step(res)
-            else:
-                for processing_step in self.pipeline:
-                    res = processing_step(res)
-        except Exception as e:
-            logging.error(f"Error processing image: {e}")
-            return None
-
-        return res
+        pipeline = self.segmentation_pipeline if is_segmentation else self.pipeline
+        for processing_step in pipeline:
+            img = processing_step(img)
+        return img
 
     @trycatch_func
     @log_func_info
     def process_image(self, img_path: str):
-        assert os.path.exists(img_path), f"Image {img_path} not found"
-        res = None
-
-        try:
-            res = self.read_process(img_path)
-            for processing_step in self.pipeline:
-                res = processing_step(res)
-        except Exception as e:
-            logging.error(f"Error processing image {img_path}: {e}")
-
-        return res
+        return self.apply_processing(self.read_process(img_path))
 
     @trycatch_func
     @log_func_info
     def process_and_save_image(self, img_path: str, exam_id: str, patient_id: str):
-        res = self.process_image(img_path)
-
-        if res is None:
+        img = self.process_image(img_path)
+        if img is None:
             return None
-
-        save_path = os.path.join(
-            self.processed_imgs_path, f"{patient_id}-{exam_id}{self.IMGS_SUFFIX}"
+        return self.save_process(
+            self._save_path(exam_id, patient_id, self.IMGS_SUFFIX), [img]
         )
-        return self.save_process(save_path, [res])
 
     @trycatch_func
     @log_func_info
     def save_image_set(self, imgs: list, exam_id: str, patient_id: str):
-        save_path = os.path.join(
-            self.processed_imgs_path, f"{patient_id}-{exam_id}{self.IMGS_SUFFIX}"
+        if not imgs or any(img is None for img in imgs):
+            logging.warning(
+                f"Not saving image set for patient {patient_id}, exam {exam_id}: missing image data."
+            )
+            return None
+
+        return self.save_process(
+            self._save_path(exam_id, patient_id, self.IMGS_SUFFIX), imgs
         )
-        return self.save_process(save_path, imgs)
 
     @trycatch_func
     @log_func_info
     def save_segmentation_set(self, segs: list, exam_id: str, patient_id: str):
-        save_path = os.path.join(
-            self.processed_imgs_path,
-            f"{patient_id}-{exam_id}{self.SEGMENTATION_SUFFIX}",
+        if not segs or any(seg is None for seg in segs):
+            return None
+
+        segs = [binarize_mask(seg) for seg in segs]
+        if all(seg.max() == 0 for seg in segs):
+            logging.warning(
+                f"Empty segmentation for patient {patient_id}, exam {exam_id}. Not saving."
+            )
+            return None
+
+        return self.save_process(
+            self._save_path(exam_id, patient_id, self.SEGMENTATION_SUFFIX), segs
         )
-        return self.save_process(save_path, segs)
 
     @trycatch_func
     @log_func_info
-    def process_segmentation_mask(self, segmentation_path: Optional[str]):
-        if segmentation_path is None:
+    def process_segmentation_mask(self, segmentation_path: str | None):
+        if segmentation_path is None or not os.path.exists(segmentation_path):
             return None
 
-        if not os.path.exists(segmentation_path):
+        seg = self.apply_processing(
+            self.read_process(segmentation_path), is_segmentation=True
+        )
+        if seg is None:
             return None
 
-        seg = None
-
-        try:
-            seg = self.read_process(segmentation_path)
-            for processing_step in self.segmentation_pipeline:
-                seg = processing_step(seg)
-            seg = seg > 0
-            if seg is None or seg.max() == 0:  # type: ignore
-                return None
-        except Exception as e:
-            logging.error(
-                f"Error processing segmentation mask {segmentation_path}: {e}"
-            )
-
-        return seg
+        # An all-zero mask carries no annotation; treat it as no mask at all.
+        seg = binarize_mask(seg)
+        return None if seg.max() == 0 else seg
 
     @trycatch_func
     @log_func_info
     def save_segmentation_mask(
-        self, segmentation_path: Optional[str], exam_id: str, patient_id: str
+            self, segmentation_path: str | None, exam_id: str, patient_id: str
     ):
         seg = self.process_segmentation_mask(segmentation_path)
         if seg is None:
             return None
 
-        save_path = os.path.join(
-            self.processed_imgs_path,
-            f"{patient_id}-{exam_id}{self.SEGMENTATION_SUFFIX}",
+        return self.save_process(
+            self._save_path(exam_id, patient_id, self.SEGMENTATION_SUFFIX), [seg]
         )
-        return self.save_process(save_path, [seg])

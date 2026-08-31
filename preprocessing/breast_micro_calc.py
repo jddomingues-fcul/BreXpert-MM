@@ -1,37 +1,40 @@
 import logging
 import os
 import uuid
-from multiprocessing import Pool, cpu_count
 
-import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from dtos.breast_cancer_dataset import (
+    ASSESSMENT_EXAM_LEVEL,
     BreastCancerDataset,
     ExamInformation,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
-from dtos.json_report_findings import Assessment, BreastFindings, JSONReportFindings
+from dtos.json_report_findings import (
+    SCOPE_INDEX_ONLY,
+    Assessment,
+    BreastFindings,
+    JSONReportFindings,
+    Lesion,
+)
 from utils.error_handling import trycatch_func
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
+    BIRADS_MAPPING,
+    CALCIFICATION,
     CRANIAL_CAUDAL,
+    MAMMOGRAPHY,
     MEDIOLATERAL_OBLIQUE,
     NOT_PRESENT,
     UNKNOWN,
     bin_age,
-    birads_assessment,
-    birads_mapping,
-    breast_density,
     csv_column_cleaning,
     get_proper_birads,
     get_proper_breast_density,
-    get_value,
     isna_v2,
-    laterality,
-    sanitize_age,
+    map_birads,
+    normalize_laterality,
 )
 
 raw_imgs_path = "../data/raw/breast-micro-calc/imgs"
@@ -42,7 +45,7 @@ csv_save_path = "../data/processed/breast-micro-calc/breast-micro-calc.csv"
 
 
 class BreastMicroCalc(BreastCancerDataset):
-    _modality = "mg"
+    _modality = MAMMOGRAPHY
     _machine = UNKNOWN
     _race = UNKNOWN
 
@@ -51,7 +54,7 @@ class BreastMicroCalc(BreastCancerDataset):
         self.image_processor = ImageProcessor(
             raw_imgs_path=raw_imgs_path,
             processed_imgs_path=processed_imgs_path,
-            image_preprocessing_config=ImagePreprocessingConfig(),
+            image_preprocessing_config=ImagePreprocessingConfig(modality=MAMMOGRAPHY),
         )
 
         self.normal_cases = pd.read_excel(
@@ -96,47 +99,22 @@ class BreastMicroCalc(BreastCancerDataset):
 
         # 4. Replace the values accordingly
         breast_micro_calc["birads"] = breast_micro_calc["birads"].apply(
-            lambda x: get_value(x, birads_assessment)
+            lambda x: map_birads(x, source="Breast-Micro-Calc", modality=MAMMOGRAPHY)
         )
         breast_micro_calc["laterality"] = breast_micro_calc["laterality"].apply(
-            lambda x: get_value(x, laterality)
-        )
-        breast_micro_calc["breast density"] = breast_micro_calc["breast density"].apply(
-            lambda x: get_value(x, breast_density)
+            normalize_laterality
         )
 
-        # Process the exams
-        n = cpu_count() - 1
-        df_split = [
-            breast_micro_calc.iloc[idx]
-            for idx in np.array_split(np.arange(len(breast_micro_calc)), n)
-            if len(idx) > 0
-        ]
+        self.run_row_pool(breast_micro_calc)
 
-        with Pool(processes=n) as p:
-            results = p.map(self.process_small_batch, df_split)
+    def get_lesion(self, row):
+        if row["subfolder"] == "Suspicious_cases":
+            return Lesion(finding_type=CALCIFICATION)
 
-        for result in results:
-            for exam in result:
-                self.append_exam(exam)
+        if row["birads"] == BIRADS_MAPPING[1]:
+            return NOT_PRESENT
 
-    @trycatch_func
-    def process_small_batch(self, df):
-        curr_exams = []
-
-        with tqdm(
-            total=len(df),
-            desc=f"Processing breast-micro-calc batch {df.index[0]} to {df.index[-1]}",
-            unit="exam",
-            ncols=100,
-            position=0,
-            leave=True,
-        ) as pbar:
-            for _, row in df.iterrows():
-                exams = self.process_row(row)
-                curr_exams.extend(exams)
-                pbar.update(1)
-        return curr_exams
+        return None
 
     @trycatch_func
     def process_row(self, row):
@@ -153,7 +131,7 @@ class BreastMicroCalc(BreastCancerDataset):
             f"MLO_recent{raw_imgs_extension}",
         )
 
-        patient = f"{row['subfolder']}_{str(row['folder #'])}"
+        patient = f"{row['subfolder']}_{row['folder #']!s}"
 
         curr_exams = []
         for exam_id, exam_img in [
@@ -179,7 +157,7 @@ class BreastMicroCalc(BreastCancerDataset):
 
             # construct context
             context = JSONReportContext(
-                patient_context=PatientContext(age=bin_age(sanitize_age(row["age"]))),
+                patient_context=PatientContext(age=bin_age(row["age"])),
                 exam_context=ExamContext(
                     modality=self._modality,
                     laterality=row["laterality"],
@@ -188,27 +166,35 @@ class BreastMicroCalc(BreastCancerDataset):
             )
 
             # construct final exam info
-            findings = JSONReportFindings(
+            assessment_birads = get_proper_birads(row["birads"], modality=MAMMOGRAPHY)
+
+            findings = JSONReportFindings.build(
                 breast=BreastFindings(
-                    density=get_proper_breast_density(row["breast density"])
+                    composition=get_proper_breast_density(row["breast density"])
                 ),
-                lesion=NOT_PRESENT if row["birads"] == birads_mapping[1] else None,
-                assessment=Assessment(birads=get_proper_birads(row["birads"])),
+                lesion=self.get_lesion(row),
+                assessment=Assessment(birads=assessment_birads),
+                annotation_scope=SCOPE_INDEX_ONLY,
             )
 
-            # We save all exams, but only the most recent will have context, findings, and birads. We do this, to keep previous exams as reference if at some point we can use them as context.
+            # Only the "recent" CC/MLO pair is loaded; the prior exams in each
+            # case folder are deliberately left out because the clinical sheet
+            # describes the recent study.
             exam = ExamInformation(
                 id=exam_id,
                 patient=f"{self.get_dataset_name()}-{patient}",
                 dataset=self.get_dataset_name(),
                 modality=self._modality,
-                birads=get_proper_birads(row["birads"]),
+                birads=assessment_birads,
                 race=self._race,
                 machine=self._machine,
                 exam=exam_imgs_path,
                 segmentation=None,
                 context=context.get_string(),
                 findings=findings.get_string(),
+                exam_id=f"{self.get_dataset_name()}-{patient}",
+                breast_id=(f"{self.get_dataset_name()}-{patient}-{row['laterality']}"),
+                assessment_scope=ASSESSMENT_EXAM_LEVEL,
             )
 
             curr_exams.append(exam)

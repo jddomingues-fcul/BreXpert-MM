@@ -4,36 +4,37 @@ import os
 import uuid
 from functools import partial
 from multiprocessing import Pool, cpu_count
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from dtos.breast_cancer_dataset import (
+    ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext
 from dtos.json_report_findings import (
+    SCOPE_COMPLETE,
     Assessment,
     BreastFindings,
     CalcificationAbnormality,
     JSONReportFindings,
     Lesion,
+    LesionLocation,
     MassAbnormality,
 )
-from utils.error_handling import log_func_info, trycatch_func
+from utils.error_handling import log_func_info, pool_worker, trycatch_func
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
+    BIRADS_MAPPING,
     CALCIFICATION,
+    MAMMOGRAPHY,
     MASS,
-    NOT_PRESENT,
     UNKNOWN,
-    birads_assessment,
-    birads_mapping,
-    breast_density,
+    birads_category_number,
     column_cleaning_csv_reading,
     dview,
     get_proper_birads,
@@ -41,11 +42,13 @@ from utils.preprocessing import (
     get_proper_calcification_distribution,
     get_proper_calcification_type,
     get_proper_exam_view,
-    get_proper_mass_margin,
+    get_proper_finding_type,
     get_proper_mass_shape,
     get_value,
     isna_v2,
-    laterality,
+    map_birads,
+    migrate_mammography_microlobulated,
+    normalize_laterality,
     read_breast_image,
 )
 
@@ -64,8 +67,8 @@ csv_save_path = "../data/processed/cbis-ddsm/cbis-ddsm.csv"
 
 
 class CbisDDSM(BreastCancerDataset):
-    _modality = "mg"
-    _machine = ["DBA", "HOWTEK", "LUMYSIS"]
+    _modality = MAMMOGRAPHY
+    _machine = UNKNOWN
     _race = UNKNOWN
 
     def __init__(self):
@@ -74,7 +77,8 @@ class CbisDDSM(BreastCancerDataset):
             raw_imgs_path=raw_imgs_path,
             processed_imgs_path=processed_imgs_path,
             image_preprocessing_config=ImagePreprocessingConfig(
-                read_func=partial(read_breast_image)
+                modality=MAMMOGRAPHY,
+                read_func=partial(read_breast_image),
             ),
         )
 
@@ -137,103 +141,205 @@ class CbisDDSM(BreastCancerDataset):
 
         # 4. Adjust column values
         self.full_df["laterality"] = self.full_df["laterality"].apply(
-            lambda x: get_value(x, laterality)
+            normalize_laterality
         )
         self.full_df["image view"] = self.full_df["image view"].apply(
             lambda x: get_value(x, dview)
         )
-        self.full_df["breast density"] = self.full_df["breast density"].apply(
-            lambda x: get_value(x, breast_density)
-        )
+        # "breast density" stays as the raw ACR code; get_proper_breast_density
+        # maps 1-4 / a-d straight onto the v2025 composition statements.
         self.full_df["assessment"] = self.full_df["assessment"].apply(
-            lambda x: get_value(x, birads_assessment)
+            lambda x: map_birads(x, source="CBIS-DDSM", modality=MAMMOGRAPHY)
         )
 
         # 5. Drop additional evaluation birads
-        self.full_df = self.full_df[self.full_df["assessment"] != birads_mapping[0]]
+        self.full_df = self.full_df[self.full_df["assessment"] != BIRADS_MAPPING[0]]
 
         # 6. Second rename cleaning
         self.full_df = self.full_df.rename(
             columns={"image view": "exam view", "mass margins": "mass margin"}
         )
 
-        # Process the exams
-        n = cpu_count() - 1
-        df_split = [
-            self.full_df.iloc[idx]
-            for idx in np.array_split(np.arange(len(self.full_df)), n)
-            if len(idx) > 0
+        # 7. Rank the abnormalities within each image
+        self.full_df = self.rank_abnormalities(self.full_df)
+
+        # Process the exams, splitting on image boundaries so that every row of
+        # one image lands in the same worker.
+        self.report.rows_seen = len(self.full_df)
+
+        image_ids = self.full_df["image file path"].unique()
+        n = max(1, cpu_count() - 1)
+        batches = [
+            self.full_df[self.full_df["image file path"].isin(chunk)]
+            for chunk in np.array_split(image_ids, n)
+            if len(chunk) > 0
         ]
+
         with Pool(processes=n) as p:
-            results = p.map(self.process_small_batch, df_split)
+            results = p.map(self.process_small_batch, batches)
 
-        for result in results:
-            for exam in result:
-                self.append_exam(exam)
+        self.collect_pool_results(results)
 
-    @trycatch_func
+    def rank_abnormalities(self, df: pd.DataFrame) -> pd.DataFrame:
+        ranked = df.copy()
+
+        ranked["_birads_rank"] = (
+            ranked["assessment"]
+            .map(birads_category_number, na_action="ignore")
+            .fillna(-1)
+            .astype(int)
+        )
+        descriptor_cols = [
+            "mass shape",
+            "mass margin",
+            "calcification type",
+            "calcification distribution",
+        ]
+        ranked["_descriptor_rank"] = (
+            ranked[descriptor_cols].notna().sum(axis=1).astype(int)
+        )
+        # Masses are the more specific finding when an image carries both.
+        ranked["_type_rank"] = (ranked["abnormality type"] == "mass").astype(int)
+
+        ranked = ranked.sort_values(
+            by=[
+                "image file path",
+                "_birads_rank",
+                "_descriptor_rank",
+                "_type_rank",
+            ],
+            ascending=[True, False, False, False],
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+        per_image = ranked.groupby("image file path").size()
+        logging.info(
+            f"CBIS-DDSM: {len(ranked)} abnormality rows across {len(per_image)} images "
+            f"({int((per_image > 1).sum())} images carry more than one finding, "
+            f"max {int(per_image.max())})."
+        )
+        return ranked
+
+    @pool_worker
     def process_small_batch(self, df):
         curr_exams = []
+        groups = list(df.groupby("image file path", sort=False))
 
         with tqdm(
-            total=len(df),
-            desc=f"Processing cbis-ddsm batch {df.index[0]} to {df.index[-1]}",
-            unit="exam",
-            ncols=100,
-            position=0,
-            leave=True,
+                total=len(groups),
+                desc="Processing cbis-ddsm batch",
+                unit="image",
+                ncols=100,
+                position=0,
+                leave=True,
         ) as pbar:
-            for _, row in df.iterrows():
-                exam = self.process_row(row)
+            for _, group in groups:
+                exam = self.process_image(group)
                 pbar.update(1)
-                if not isna_v2(exam):
+                if exam is not None:
                     curr_exams.append(exam)
         return curr_exams
 
     @trycatch_func
-    def process_row(self, row):
+    def process_image(self, group: pd.DataFrame):
+        lead = group.iloc[0]
         exam_id = str(uuid.uuid4())
+        patient_id = str(lead["patient id"])
+
         exam_path, img_shape = self.save_slice(
-            row["image file path"], exam_id, str(row["patient id"])
+            lead["image file path"], exam_id, patient_id
         )
 
         if isna_v2(exam_path):
             logging.warning(
-                f"Image processing failed for patient {row['patient id']}, exam {row['image file path']}. Skipping exam."
+                f"Image processing failed for patient {patient_id}, "
+                f"exam {lead['image file path']}. Skipping exam."
             )
             return None
 
-        segmentation_path = self.save_segmentation(
-            exam_id, str(row["patient id"]), row["roi mask file path"], img_shape
-        )
+        segmentation_paths = []
+        for position, (_, row) in enumerate(group.iterrows()):
+            path = self.save_segmentation(
+                f"{exam_id}-L{position + 1}",
+                patient_id,
+                row["roi mask file path"],
+                img_shape,
+            )
+            if not isna_v2(path):
+                segmentation_paths.append(path)
 
-        # construct context
         context = JSONReportContext(
             exam_context=ExamContext(
                 modality=self._modality,
-                laterality=row["laterality"],
-                view=get_proper_exam_view(row["exam view"]),
+                laterality=lead["laterality"],
+                view=get_proper_exam_view(lead["exam view"]),
             )
         )
 
-        tgt_lesion = None
+        lesions = [self.construct_lesion(row) for _, row in group.iterrows()]
+        lesions = [lesion for lesion in lesions if lesion is not None]
+        if lesions:
+            lesions[0].is_index = True
+
+        assessment_birads = get_proper_birads(lead["assessment"], modality=MAMMOGRAPHY)
+
+        findings = JSONReportFindings.build(
+            breast=BreastFindings(
+                composition=get_proper_breast_density(lead["breast density"])
+            ),
+            lesion=lesions if lesions else None,
+            assessment=Assessment(birads=assessment_birads),
+            annotation_scope=SCOPE_COMPLETE,
+        )
+
+        return ExamInformation(
+            id=exam_id,
+            patient=f"{self.get_dataset_name()}-{patient_id}",
+            dataset=self.get_dataset_name(),
+            modality=self._modality,
+            birads=assessment_birads,
+            race=self._race,
+            machine=self._machine,
+            exam=exam_path,
+            segmentation=segmentation_paths or None,
+            context=context.get_string(),
+            findings=findings.get_string(),
+            exam_id=f"{self.get_dataset_name()}-{patient_id}-{lead['laterality']}",
+            breast_id=f"{self.get_dataset_name()}-{patient_id}-{lead['laterality']}",
+            assessment_scope=ASSESSMENT_GROUNDED,
+        )
+
+    def construct_lesion(self, row) -> Lesion | None:
+        location = LesionLocation(laterality=row["laterality"])
+
         if row["abnormality type"] == "mass":
-            tgt_lesion = Lesion(
-                laterality=row["laterality"],
-                type=MASS,
-                mass_details=MassAbnormality(
-                    shape=get_proper_mass_shape(row["mass shape"]),
-                    margin=get_proper_mass_margin(row["mass margin"]),
-                ),
+            shape_value = row["mass shape"]
+            routed = (
+                get_proper_finding_type(shape_value, MAMMOGRAPHY)
+                if not isna_v2(shape_value)
+                   and get_proper_mass_shape(shape_value) is None
+                else None
             )
 
-        elif row["abnormality type"] == "calcification":
+            if routed is not None and routed != MASS:
+                return Lesion(location=location, finding_type=routed)
+
+            shape, margin = migrate_mammography_microlobulated(
+                shape_value, row["mass margin"]
+            )
+            return Lesion(
+                location=location,
+                finding_type=MASS,
+                mass_details=MassAbnormality(shape=shape, margin=margin),
+            )
+
+        if row["abnormality type"] == "calcification":
             calc_type, calc_details = get_proper_calcification_type(
                 row["calcification type"]
             )
-            tgt_lesion = Lesion(
-                laterality=row["laterality"],
-                type=CALCIFICATION,
+            return Lesion(
+                location=location,
+                finding_type=CALCIFICATION,
                 calcification_details=CalcificationAbnormality(
                     type=calc_type,
                     type_details=calc_details,
@@ -243,34 +349,7 @@ class CbisDDSM(BreastCancerDataset):
                 ),
             )
 
-        # construct final exam info
-        findings = JSONReportFindings(
-            breast=BreastFindings(
-                density=get_proper_breast_density(row["breast density"])
-            ),
-            lesion=(
-                NOT_PRESENT if row["assessment"] == birads_mapping[1] else tgt_lesion
-            ),
-            assessment=Assessment(birads=get_proper_birads(row["assessment"])),
-        )
-
-        return ExamInformation(
-            id=exam_id,
-            patient=f"{self.get_dataset_name()}-{row['patient id']}",
-            dataset=self.get_dataset_name(),
-            modality=self._modality,
-            birads=get_proper_birads(row["assessment"]),
-            race=self._race,
-            machine=";".join(
-                self._machine
-            ),  # join them with ; to indicate multiple possible machines
-            exam=exam_path,
-            segmentation=(
-                [segmentation_path] if not isna_v2(segmentation_path) else None
-            ),
-            context=context.get_string(),
-            findings=findings.get_string(),
-        )
+        return None
 
     @trycatch_func
     @log_func_info
@@ -281,9 +360,22 @@ class CbisDDSM(BreastCancerDataset):
             base_folder,
             f"*{raw_imgs_extension}",
         )
-        im_path = glob.glob(path, recursive=True)[0]
+        matches = glob.glob(path, recursive=True)
+        if not matches:
+            logging.warning(f"No full image found under {path}.")
+            return None, None
 
-        img = self.image_processor.process_image(im_path)
+        im_path = matches[0]
+        raw_img = self.image_processor.read_image(im_path)
+        if raw_img is None:
+            return None, None
+
+        # Return the *raw* shape: the caller uses it to pick the ROI file that
+        # shares the image's coordinate frame, and every processed image is
+        # 512x512 so the processed shape carries no information.
+        raw_shape = raw_img.shape
+
+        img = self.image_processor.apply_processing(raw_img, is_segmentation=False)
         if img is None:
             return None, None
 
@@ -291,25 +383,31 @@ class CbisDDSM(BreastCancerDataset):
             processed_imgs_path,
             f"{patient_id}-{exam_id}{ImageProcessor.IMGS_SUFFIX}",
         )
-        return self.image_processor.save_process(save_path, [img]), img.shape
+        return self.image_processor.save_process(save_path, [img]), raw_shape
 
     @trycatch_func
     @log_func_info
     def save_segmentation(
-        self, exam_id, patient_id, roi_image_path, img_shape
-    ) -> Optional[str]:
+            self, exam_id, patient_id, roi_image_path, img_shape
+    ) -> str | None:
         base_folder = roi_image_path.split("/")[-2]
         path = os.path.join(
             raw_imgs_path,
             base_folder,
             f"*{raw_imgs_extension}",
         )
-        available_img_paths = glob.glob(path, recursive=True)
+        available_img_paths = sorted(glob.glob(path, recursive=True))
 
         if not available_img_paths or img_shape is None:
             return None
 
-        mask_path = self.get_adequate_mask_path(available_img_paths)
+        mask_path = self.get_adequate_mask_path(available_img_paths, img_shape)
+        if mask_path is None:
+            logging.warning(
+                f"No ROI file matching the full image geometry {img_shape} under {path}."
+            )
+            return None
+
         seg_mask = self.image_processor.process_segmentation_mask(mask_path)
 
         if seg_mask is not None:
@@ -321,22 +419,12 @@ class CbisDDSM(BreastCancerDataset):
 
         return None
 
-    def get_adequate_mask_path(self, available_img_paths: list):
-        if len(available_img_paths) == 1:
-            logging.warning(
-                f"Only one image found for segmentation mask. Using {available_img_paths[0]}"
-            )
-            return available_img_paths[0]
-        else:
-            # read each image and select the one with the highest resolution
-            shapes = []
-            for img in available_img_paths:
-                current_img = self.image_processor.read_image(img)
-                if current_img is None:
-                    continue
-                shapes.append(current_img.shape[0] * current_img.shape[1])
+    def get_adequate_mask_path(self, available_img_paths: list, img_shape):
+        for candidate in available_img_paths:
+            current_img = self.image_processor.read_image(candidate)
+            if current_img is None:
+                continue
+            if current_img.shape == img_shape:
+                return candidate
 
-            if len(shapes) == 0:
-                return None
-
-            return available_img_paths[np.argmax(shapes)]
+        return None

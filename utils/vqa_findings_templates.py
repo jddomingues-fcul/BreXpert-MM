@@ -1,23 +1,543 @@
+"""
+1. Every field declares its ANSWER SPACE.
+
+2. Every field declares its position in a CLINICAL DRILL-DOWN and what it
+   depends on. The dialogue walks composition -> presence -> count -> per-finding
+   type -> location -> descriptors -> assessment, so a wrong answer is
+   attributable to a step and "accuracy given the parent turn was right" is
+   computable.
+"""
+
+from __future__ import annotations
+
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
+
+from utils.preprocessing import (
+    ASYMMETRY,
+    BREAST_COMPOSITION_ORDER,
+    CALCIFICATION,
+    CALCIFICATION_DISTRIBUTION_ORDER,
+    DEPTHS,
+    ECHOGENIC_FEATURES,
+    MAMMOGRAPHY,
+    MARGIN_ORDER,
+    MASS,
+    MASS_DENSITY_ORDER,
+    MASS_ECHO_PATTERN_ORDER,
+    MASS_SHAPE_ORDER,
+    MRI,
+    MRI_FGT_ORDER,
+    NON_MASS_ENHANCEMENT,
+    NON_MASS_LESION,
+    POSTERIOR_FEATURES_ORDER,
+    QUADRANTS,
+    SPECIAL_LOCATIONS,
+    SUSPICIOUS_CALCIFICATIONS,
+    TISSUE_COMPOSITION_VALUES,
+    TYPICALLY_BENIGN_CALCIFICATIONS,
+    ULTRASOUND,
+)
 
 AnswerSource = Literal["image", "image+context"]
 NegativeCase = Literal["no_lesion", "wrong_modality", "wrong_lesion_type"]
+Scope = Literal["sample", "lesion"]
+
+# Which context sentence a question needs in order to be answerable. The context
+# builder drops sentences at random to vary how much is given; a question whose
+# supporting sentence was dropped is unanswerable and must not be asked. These
+# keys match the fields the context builder reads.
+CTX_LATERALITY = "laterality"
+
+# Stages of the drill-down, asked in this order.
+STAGE_COMPOSITION = 1
+STAGE_PRESENCE = 2
+STAGE_COUNT = 3
+STAGE_FINDING_TYPE = 4
+STAGE_LOCATION = 5
+STAGE_DESCRIPTOR = 6
+STAGE_ASSESSMENT = 7
+
+BIRADS_ANSWER_SPACE = (
+    "(1) negative",
+    "(2) benign",
+    "(3) probably benign",
+    "(4) suspicious",
+    "(5) highly suggestive of malignancy",
+)
+
+CALCIFICATION_TYPE_FAMILIES = ("typically benign", "suspicious morphology")
+CALCIFICATION_MORPHOLOGIES = TYPICALLY_BENIGN_CALCIFICATIONS + SUSPICIOUS_CALCIFICATIONS
+
+# Mass margin differs by modality in v2025, so its answer space is a mapping
+# rather than a flat tuple.
+MARGIN_ANSWER_SPACE = dict(MARGIN_ORDER)
 
 
-@dataclass
+@dataclass(frozen=True)
 class FieldSpec:
     field_id: str
     task_type: str
     templates: list[str]
+
+    solo_templates: list[str] | None = None
+
+    answer_space: tuple[str, ...] | dict[str, tuple[str, ...]] | None = None
+
     difficulty: str = "medium"
-    scope: str = "sample"  # sample or lesion
+    scope: Scope = "sample"
     answer_source: AnswerSource = "image"
-    negative_response_templates: Optional[dict[NegativeCase, str]] = None  # mapping from case to list of templates
+    stage: int = STAGE_DESCRIPTOR
+
+    # Context keys without which the question cannot be answered.
+    requires_context: tuple[str, ...] = ()
+
+    negative_response_templates: dict[NegativeCase, str] | None = None
+
+    def answers_for(self, modality: str) -> tuple[str, ...] | None:
+        if self.answer_space is None:
+            return None
+        if isinstance(self.answer_space, dict):
+            return self.answer_space.get(modality)
+        return self.answer_space
 
 
 FIELD_SPECS: list[FieldSpec] = [
+    # ---------------------------------------------------------------- breast
+    FieldSpec(
+        field_id="breast.composition",
+        task_type="breast_composition",
+        templates=[
+            "What is the breast composition?",
+            "Which breast composition category applies?",
+            "How is the breast composition classified?",
+            "Breast composition?",
+            "What ACR breast composition category is this?",
+            "How would you describe the breast composition?",
+            "What composition category is assigned to the breast tissue?",
+            "Which density category does this mammogram fall into?",
+        ],
+        answer_space=BREAST_COMPOSITION_ORDER,
+        difficulty="medium",
+        scope="sample",
+        stage=STAGE_COMPOSITION,
+        answer_source="image",
+        negative_response_templates={
+            "wrong_modality": "Breast composition is a mammographic assessment; it is not reported for this modality."
+        },
+    ),
+    FieldSpec(
+        field_id="breast.fgt",
+        task_type="mri_fgt",
+        templates=[
+            "What is the amount of fibroglandular tissue?",
+            "How much fibroglandular tissue is there?",
+            "Which FGT category applies?",
+            "Fibroglandular tissue?",
+            "How is the fibroglandular tissue classified?",
+            "What FGT category is reported?",
+            "How would you describe the amount of fibroglandular tissue?",
+            "Which fibroglandular tissue group does this case fall into?",
+        ],
+        answer_space=MRI_FGT_ORDER,
+        difficulty="medium",
+        scope="sample",
+        stage=STAGE_COMPOSITION,
+        answer_source="image",
+        negative_response_templates={
+            "wrong_modality": "Fibroglandular tissue is assessed on MRI; it is not reported for this modality."
+        },
+    ),
+    FieldSpec(
+        field_id="breast.tissue composition",
+        task_type="us_tissue_composition",
+        templates=[
+            "What is the breast tissue composition?",
+            "What background echotexture is reported?",
+            "How is the tissue composition classified?",
+            "Tissue composition?",
+            "Which tissue composition category applies here?",
+            "How would you describe the background echotexture?",
+            "What composition is noted for the breast tissue?",
+            "Which tissue composition group does this case fall into?",
+        ],
+        answer_space=TISSUE_COMPOSITION_VALUES,
+        difficulty="medium",
+        scope="sample",
+        stage=STAGE_COMPOSITION,
+        answer_source="image",
+        negative_response_templates={
+            "wrong_modality": "Background echotexture is an ultrasound assessment; it is not reported for this modality."
+        },
+    ),
+    # -------------------------------------------------------------- presence
+    FieldSpec(
+        field_id="lesion.presence",
+        task_type="lesion_presence",
+        templates=[
+            "Are any findings present?",
+            "Is there any lesion present?",
+            "Does this image show any findings?",
+            "Any lesions?",
+            "Are there any findings in this image?",
+            "Is a lesion identified here?",
+            "Do you see any lesion?",
+            "Does the image contain a lesion?",
+        ],
+        answer_space=("yes", "no"),
+        difficulty="medium",
+        scope="sample",
+        stage=STAGE_PRESENCE,
+        answer_source="image",
+    ),
+    FieldSpec(
+        field_id="lesion.count",
+        task_type="lesion_count",
+        templates=[
+            "How many findings are present?",
+            "How many lesions are there?",
+            "Number of findings?",
+            "How many distinct findings can you identify?",
+            "Count the findings in this image.",
+        ],
+        # Free numeric: the answer is a small integer, not a term.
+        answer_space=None,
+        difficulty="hard",
+        scope="sample",
+        stage=STAGE_COUNT,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "There are no findings in this image.",
+        },
+    ),
+    # ---------------------------------------------------------- finding type
+    FieldSpec(
+        field_id="lesion.finding type",
+        task_type="lesion_type",
+        templates=[
+            "What type of finding is {referent}?",
+            "What is the finding type of {referent}?",
+            "How is {referent} categorized?",
+            "What kind of finding is {referent}?",
+            "Which finding category does {referent} belong to?",
+            "How would you classify {referent}?",
+        ],
+        solo_templates=[
+            "What type of finding is present?",
+            "What is the finding type?",
+            "How is the finding categorized?",
+            "What kind of finding is seen?",
+            "Which finding category does this fall into?",
+            "How would you classify this finding?",
+        ],
+        answer_space={
+            MAMMOGRAPHY: (
+                MASS,
+                CALCIFICATION,
+                "architectural distortion",
+                ASYMMETRY,
+                "lymph node",
+                "skin lesion",
+                "dilated duct",
+            ),
+            ULTRASOUND: (MASS, NON_MASS_LESION, CALCIFICATION, "lymph node"),
+            MRI: (MASS, NON_MASS_ENHANCEMENT, "lymph node"),
+        },
+        difficulty="medium",
+        scope="lesion",
+        stage=STAGE_FINDING_TYPE,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no finding, finding type is not applicable.",
+        },
+    ),
+    # -------------------------------------------------------------- location
+    FieldSpec(
+        field_id="lesion.location.laterality",
+        task_type="lesion_laterality",
+        templates=[
+            "Which breast contains {referent}?",
+            "What is the laterality of {referent}?",
+            "Is {referent} in the left or right breast?",
+            "What side is {referent} on?",
+            "Which side contains {referent}?",
+            "On which side is {referent} identified?",
+        ],
+        answer_space=("left", "right"),
+        difficulty="medium",
+        scope="lesion",
+        stage=STAGE_LOCATION,
+        answer_source="image+context",
+        requires_context=(CTX_LATERALITY,),
+        negative_response_templates={
+            "no_lesion": "Since there is no finding, laterality is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.location.quadrant",
+        task_type="lesion_quadrant",
+        templates=[
+            "Which quadrant contains {referent}?",
+            "What quadrant does {referent} occupy?",
+            "In which breast quadrant is {referent}?",
+            "What is the quadrant location of {referent}?",
+            "Which breast quadrant does {referent} involve?",
+        ],
+        answer_space=QUADRANTS,
+        difficulty="medium",
+        scope="lesion",
+        stage=STAGE_LOCATION,
+        answer_source="image+context",
+        requires_context=(CTX_LATERALITY,),
+        negative_response_templates={
+            "no_lesion": "Since there is no finding, location is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.location.clock position",
+        task_type="lesion_clock_position",
+        templates=[
+            "What is the clock position of {referent}?",
+            "At what o'clock position is {referent}?",
+            "Where is {referent} on the clock face?",
+            "At which hour is {referent} located?",
+            "What is the clock-face location of {referent}?",
+        ],
+        answer_space=tuple(str(hour) for hour in range(1, 13)),
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_LOCATION,
+        answer_source="image+context",
+        requires_context=(CTX_LATERALITY,),
+        negative_response_templates={
+            "no_lesion": "Since there is no finding, clock position is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.location.depth",
+        task_type="lesion_depth",
+        templates=[
+            "At what depth is {referent}?",
+            "What is the depth of {referent}?",
+            "Which third of the breast contains {referent}?",
+            "How deep in the breast is {referent}?",
+            "Is {referent} anterior, middle or posterior?",
+        ],
+        answer_space=DEPTHS,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_LOCATION,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no finding, depth is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.location.special location",
+        task_type="lesion_special_location",
+        templates=[
+            "Is {referent} in a special location?",
+            "What special location does {referent} occupy?",
+            "Is {referent} retroareolar, central or in the axillary tail?",
+            "Which special location applies to {referent}?",
+            "What named region contains {referent}?",
+        ],
+        answer_space=SPECIAL_LOCATIONS,
+        difficulty="medium",
+        scope="lesion",
+        stage=STAGE_LOCATION,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no finding, location is not applicable.",
+        },
+    ),
+    # ----------------------------------------------------------- mass detail
+    FieldSpec(
+        field_id="lesion.mass details.shape",
+        task_type="mass_shape",
+        templates=[
+            "What is the shape of {referent}?",
+            "How is the shape of {referent} described?",
+            "What shape does {referent} have?",
+            "Describe the shape of {referent}.",
+            "Which shape category applies to {referent}?",
+        ],
+        answer_space=MASS_SHAPE_ORDER,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no mass, shape is not applicable.",
+            "wrong_lesion_type": "Since this finding is not a mass, mass shape is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.mass details.margin",
+        task_type="mass_margin",
+        templates=[
+            "What is the margin of {referent}?",
+            "How is the margin of {referent} described?",
+            "What are the margins of {referent}?",
+            "How would you describe the margin of {referent}?",
+            "Which margin category applies to {referent}?",
+        ],
+        answer_space=MARGIN_ANSWER_SPACE,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no mass, margin is not applicable.",
+            "wrong_lesion_type": "Since this finding is not a mass, mass margin is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.mass details.density",
+        task_type="mass_density",
+        templates=[
+            "What is the density of {referent}?",
+            "How is the density of {referent} described?",
+            "What density does {referent} have?",
+            "Which density class applies to {referent}?",
+            "How dense is {referent}?",
+        ],
+        answer_space=MASS_DENSITY_ORDER,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no mass, density is not applicable.",
+            "wrong_modality": "Mass density is a mammographic descriptor; it is not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a mass, mass density is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.mass details.echo pattern",
+        task_type="mass_echo_pattern",
+        templates=[
+            "What is the echo pattern of {referent}?",
+            "How is the echogenicity of {referent} described?",
+            "What echogenicity does {referent} have?",
+            "Which echo pattern applies to {referent}?",
+            "How echogenic is {referent}?",
+        ],
+        answer_space=MASS_ECHO_PATTERN_ORDER,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no mass, echo pattern is not applicable.",
+            "wrong_modality": "Echo pattern is an ultrasound descriptor; it is not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a mass, mass echo pattern is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.mass details.posterior features",
+        task_type="mass_posterior_features",
+        templates=[
+            "What are the posterior acoustic features of {referent}?",
+            "How are the posterior features of {referent} described?",
+            "What posterior features does {referent} show?",
+            "What is seen posterior to {referent}?",
+            "Which posterior acoustic pattern applies to {referent}?",
+        ],
+        answer_space=POSTERIOR_FEATURES_ORDER,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no mass, posterior features are not applicable.",
+            "wrong_modality": "Posterior features are an ultrasound descriptor; they are not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a mass, posterior features are not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.mass details.echogenic feature",
+        task_type="mass_echogenic_feature",
+        templates=[
+            "What echogenic boundary feature does {referent} show?",
+            "Does {referent} have an echogenic pseudocapsule or an echogenic rind?",
+            "How is the echogenic boundary of {referent} described?",
+            "Which echogenic feature applies to {referent}?",
+        ],
+        answer_space=ECHOGENIC_FEATURES,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there is no mass, echogenic features are not applicable.",
+            "wrong_modality": "Echogenic pseudocapsule and rind are ultrasound descriptors; they are not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a mass, echogenic features are not applicable.",
+        },
+    ),
+    # -------------------------------------------------- calcification detail
+    FieldSpec(
+        field_id="lesion.calcification details.type",
+        task_type="calcification_type_family",
+        templates=[
+            "What calcification type category does {referent} fall into?",
+            "How would you categorize {referent}?",
+            "Is {referent} typically benign or suspicious in morphology?",
+            "Which calcification family applies to {referent}?",
+        ],
+        answer_space=CALCIFICATION_TYPE_FAMILIES,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there are no calcifications, calcification type is not applicable.",
+            "wrong_modality": "Calcification morphology is a mammographic descriptor; it is not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a group of calcifications, calcification type is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.calcification details.type details",
+        task_type="calcification_type_details",
+        templates=[
+            "What is the calcification morphology of {referent}?",
+            "How is the morphology of {referent} described?",
+            "What morphology does {referent} show?",
+            "Which morphology category applies to {referent}?",
+        ],
+        answer_space=CALCIFICATION_MORPHOLOGIES,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there are no calcifications, morphology is not applicable.",
+            "wrong_modality": "Calcification morphology is a mammographic descriptor; it is not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a group of calcifications, morphology is not applicable.",
+        },
+    ),
+    FieldSpec(
+        field_id="lesion.calcification details.distribution",
+        task_type="calcification_distribution",
+        templates=[
+            "What is the distribution of {referent}?",
+            "How is {referent} distributed?",
+            "What distribution pattern does {referent} show?",
+            "Which distribution class applies to {referent}?",
+        ],
+        answer_space=CALCIFICATION_DISTRIBUTION_ORDER,
+        difficulty="hard",
+        scope="lesion",
+        stage=STAGE_DESCRIPTOR,
+        answer_source="image",
+        negative_response_templates={
+            "no_lesion": "Since there are no calcifications, distribution is not applicable.",
+            "wrong_modality": "Calcification distribution is a mammographic descriptor; it is not reported for this modality.",
+            "wrong_lesion_type": "Since this finding is not a group of calcifications, distribution is not applicable.",
+        },
+    ),
+    # ------------------------------------------------------------ assessment
     FieldSpec(
         field_id="assessment.birads",
         task_type="assessment_birads",
@@ -26,430 +546,129 @@ FIELD_SPECS: list[FieldSpec] = [
             "What BI-RADS category applies to this case?",
             "What is the final BI-RADS classification?",
             "BI-RADS?",
-            "What is the final BI-RADS category?",
             "Which BI-RADS assessment is assigned?",
             "How is this case categorized in BI-RADS?",
-            "What BI-RADS score is reported?",
             "What is the overall BI-RADS result?",
-            "Which BI-RADS class does this case fall under?",
         ],
+        answer_space=BIRADS_ANSWER_SPACE,
         difficulty="hard",
         scope="sample",
+        stage=STAGE_ASSESSMENT,
         answer_source="image+context",
-    ),
-    FieldSpec(
-        field_id="breast.density",
-        task_type="breast_density",
-        templates=[
-            "What is the breast density?",
-            "What breast density category is reported?",
-            "How is the breast density classified?",
-            "Breast density?",
-            "Which breast density category applies here?",
-            "What density category is assigned to the breast tissue?",
-            "How would you describe the breast density?",
-            "What is the reported density classification?",
-            "What density is noted for the breasts?",
-            "Which density group does this case belong to?",
-        ],
-        difficulty="medium",
-        scope="sample",
-        answer_source="image+context",  # yes, implants case
-        negative_response_templates={"wrong_modality": "Breast density is not assessed on this modality. Only on MG and MR."},
-    ),
-    FieldSpec(
-        field_id="breast.tissue composition",
-        task_type="us_tissue_composition",
-        templates=[
-            "What is the breast tissue composition?",
-            "What tissue composition is reported?",
-            "How is the tissue composition classified?",
-            "Tissue composition?",
-            "Which tissue composition category applies here?",
-            "How would you describe the breast tissue composition?",
-            "What composition is noted for the breast tissue?",
-            "What is the reported tissue composition category?",
-            "How is the US tissue composition described?",
-            "Which tissue composition group does this case fall into?",
-        ],
-        difficulty="medium",
-        scope="sample",
-        answer_source="image+context",
-        negative_response_templates={"wrong_modality": "Tissue composition is not assessed on this modality. Only on US."},
-    ),
-    FieldSpec(
-        field_id="lesion.presence",
-        task_type="lesion_presence",
-        templates=[
-            "Are any lesions present?",
-            "Is there any lesion present?",
-            "Does this case show any lesions?",
-            "Any lesions?",
-            "Are there any lesions in this case?",
-            "Is a lesion identified here?",
-            "Do you see any lesion?",
-            "Are any suspicious lesions present?",
-            "Is any lesion present?",
-            "Does the image contain a lesion?",
-        ],
-        difficulty="medium",
-        scope="sample",
-        answer_source="image",
-    ),
-    FieldSpec(
-        field_id="lesion.type",
-        task_type="lesion_type",
-        templates=[
-            "What type of lesion is present?",
-            "What is the lesion type?",
-            "What kind of lesion is this?",
-            "Lesion type?",
-            "How is the lesion categorized?",
-            "What lesion category is shown?",
-            "What sort of lesion is present?",
-            "What abnormality type is this lesion?",
-            "Which type of finding is this lesion?",
-            "How would you classify the lesion type?",
-        ],
-        difficulty="medium",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no lesion, lesion type is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.location",
-        task_type="lesion_location",
-        templates=[
-            "Where is the lesion located?",
-            "What is the lesion location?",
-            "Where is this lesion?",
-            "What location is reported for the lesion?",
-            "In what location is the lesion found?",
-            "Where is the finding located?",
-            "What is the position of the lesion?",
-            "Where can the lesion be seen?",
-            "What site does the lesion involve?",
-            "Where in the breast is the lesion located?",
-        ],
-        difficulty="medium",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no lesion, location is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.laterality",
-        task_type="lesion_laterality",
-        templates=[
-            "What is the lesion laterality?",
-            "Which breast contains the lesion?",
-            "Is the lesion in the left or right breast?",
-            "What side is the lesion on?",
-            "Which side contains the lesion?",
-            "What is the side of the lesion?",
-            "Is the lesion located in the left breast or the right breast?",
-            "Which breast is involved by the lesion?",
-            "What laterality is reported for the lesion?",
-            "On which side is the lesion identified?",
-        ],
-        difficulty="medium",
-        scope="lesion",
-        answer_source="image+context",
-        negative_response_templates={
-            "no_lesion": "Since there is no lesion, laterality is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.mass details.shape",
-        task_type="mass_shape",
-        templates=[
-            "What is the mass shape?",
-            "How is the mass shape described?",
-            "What shape is the mass?",
-            "Shape?",
-            "What shape does the lesion have?",
-            "Describe the lesion shape.",
-            "How would you describe the mass shape?",
-            "What is the shape of this mass?",
-            "Which shape category applies to the mass?",
-            "How is this mass shaped?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no mass, shape is not applicable.",
-            "wrong_lesion_type": "Since this lesion is not a mass, mass shape is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.mass details.margin",
-        task_type="mass_margin",
-        templates=[
-            "What is the mass margin?",
-            "How is the mass margin described?",
-            "Mass margin?",
-            "What are the margins of the mass?",
-            "How would you describe the mass margin?",
-            "What margin type is reported for the mass?",
-            "How are the mass borders described?",
-            "What is the border characteristic of the mass?",
-            "Which margin category applies to the mass?",
-            "What is the margin appearance of the mass?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no mass, margin is not applicable.",
-            "wrong_lesion_type": "Since this lesion is not a mass, mass margin is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.mass details.density",
-        task_type="mass_density",
-        templates=[
-            "What is the mass density?",
-            "How is the mass density described?",
-            "Mass density?",
-            "What density does the mass have?",
-            "How would you describe the density of the mass?",
-            "What density category is reported for the mass?",
-            "How is the lesion density characterized?",
-            "What is the reported density of this mass?",
-            "Which density class applies to the mass?",
-            "How dense is the mass?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no mass, density is not applicable.",
-            "wrong_modality": "Mass density is not applicable to this modality. Only to MG and MR.",
-            "wrong_lesion_type": "Since this lesion is not a mass, mass density is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.mass details.echogenicity",
-        task_type="mass_echogenicity",
-        templates=[
-            "What is the mass echogenicity?",
-            "How is the mass echogenicity described?",
-            "Mass echogenicity?",
-            "What echogenicity does the mass have?",
-            "How would you describe the echogenicity of the mass?",
-            "What echogenicity category is reported?",
-            "How is the lesion echogenicity characterized?",
-            "What is the reported echogenicity of the mass?",
-            "Which echogenicity class applies to the mass?",
-            "How echogenic is the mass?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no mass, echogenicity is not applicable.",
-            "wrong_modality": "Mass echogenicity is not applicable to this modality. Only to US.",
-            "wrong_lesion_type": "Since this lesion is not a mass, mass echogenicity is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.mass details.posterior features",
-        task_type="mass_posterior_features",
-        templates=[
-            "What are the posterior acoustic features?",
-            "How are the posterior features described?",
-            "Posterior acoustic features?",
-            "What posterior features are present?",
-            "How would you describe the posterior acoustic behavior?",
-            "What posterior acoustic pattern is reported?",
-            "How is the posterior effect characterized?",
-            "What is noted posterior to the mass?",
-            "Which posterior acoustic features apply here?",
-            "What are the posterior acoustic findings?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no mass, posterior features is not applicable.",
-            "wrong_modality": "Mass posterior features is not applicable to this modality. Only to US.",
-            "wrong_lesion_type": "Since this lesion is not a mass, mass posterior features is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.mass details.halo",
-        task_type="mass_halo",
-        templates=[
-            "Is a halo present around the mass?",
-            "Is there a halo sign?",
-            "Halo present?",
-            "Is a halo seen around the lesion?",
-            "Does the mass show a halo?",
-            "Is a surrounding halo identified?",
-            "Is there a halo around the mass?",
-            "Do you see a halo sign around the lesion?",
-            "Is halo formation present?",
-            "Is a peripheral halo present?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no mass, halo is not applicable.",
-            "wrong_modality": "Mass halo is not applicable to this modality. Only to US.",
-            "wrong_lesion_type": "Since this lesion is not a mass, mass halo is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.calcification details.type",
-        task_type="calcification_type_family",
-        templates=[
-            "What is the calcification type category?",
-            "How are the calcifications categorized?",
-            "Calcification type?",
-            "What type of calcifications are present?",
-            "How would you classify the calcification type?",
-            "What calcification category is reported?",
-            "Which calcification family applies here?",
-            "What is the reported calcification class?",
-            "How is the calcification pattern categorized?",
-            "What type category do the calcifications fall into?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there is no lesion, calcification type is not applicable.",
-            "wrong_modality": "Calcification type is not applicable to this modality. Only to MG and MR.",
-            "wrong_lesion_type": "Since this lesion is not a calcification, calcification type is not applicable.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.calcification details.type details",
-        task_type="calcification_type_details",
-        templates=[
-            "What is the calcification morphology?",
-            "How are the calcifications morphologically described?",
-            "Calcification morphology?",
-            "What morphology do the calcifications have?",
-            "How would you describe the calcification morphology?",
-            "What morphologic pattern is reported for the calcifications?",
-            "How is the calcification appearance characterized?",
-            "What is the detailed morphology of the calcifications?",
-            "Which morphology category applies to the calcifications?",
-            "What is the reported calcification form?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there are no calcifications, morphology is not applicable.",
-            "wrong_modality": "Calcification morphology is not applicable to this modality. Only to MG and MR.",
-        },
-    ),
-    FieldSpec(
-        field_id="lesion.calcification details.distribution",
-        task_type="calcification_distribution",
-        templates=[
-            "What is the calcification distribution?",
-            "How are the calcifications distributed?",
-            "Calcification distribution?",
-            "What distribution pattern do the calcifications show?",
-            "How would you describe the calcification distribution?",
-            "What distribution category is reported for the calcifications?",
-            "How is the spread of the calcifications characterized?",
-            "What is the reported calcification distribution pattern?",
-            "Which distribution class applies to the calcifications?",
-            "How are these calcifications arranged?",
-        ],
-        difficulty="hard",
-        scope="lesion",
-        answer_source="image",
-        negative_response_templates={
-            "no_lesion": "Since there are no calcifications, distribution is not applicable.",
-            "wrong_modality": "Calcification distribution is not applicable to this modality. Only to MG and MR.",
-        },
     ),
 ]
 
+FIELD_SPECS_BY_ID: dict[str, FieldSpec] = {spec.field_id: spec for spec in FIELD_SPECS}
+
+# ===========================================================================
+# APPLICABILITY RULES
+# ===========================================================================
 MODALITY_RULES: dict[str, set[str]] = {
-    "breast.density": {"mg", "mr"},
-    "breast.tissue composition": {"us"},
-    "lesion.mass details.echogenicity": {"us"},
-    "lesion.mass details.posterior features": {"us"},
-    "lesion.mass details.halo": {"us"},
-    "lesion.mass details.density": {"mg", "mr"},
-    "lesion.calcification details.type": {"mg", "mr"},
-    "lesion.calcification details.type details": {"mg", "mr"},
-    "lesion.calcification details.distribution": {"mg", "mr"},
+    "breast.composition": {MAMMOGRAPHY},
+    "breast.fgt": {MRI},
+    "breast.tissue composition": {ULTRASOUND},
+    "lesion.mass details.density": {MAMMOGRAPHY},
+    "lesion.mass details.echo pattern": {ULTRASOUND},
+    "lesion.mass details.posterior features": {ULTRASOUND},
+    "lesion.mass details.echogenic feature": {ULTRASOUND},
+    "lesion.calcification details.type": {MAMMOGRAPHY},
+    "lesion.calcification details.type details": {MAMMOGRAPHY},
+    "lesion.calcification details.distribution": {MAMMOGRAPHY},
 }
 
 LESION_TYPE_RULES: dict[str, set[str]] = {
-    "lesion.mass details.shape": {"mass"},
-    "lesion.mass details.margin": {"mass"},
-    "lesion.mass details.density": {"mass"},
-    "lesion.mass details.echogenicity": {"mass"},
-    "lesion.mass details.posterior features": {"mass"},
-    "lesion.mass details.halo": {"mass"},
-    "lesion.calcification details.type": {"calcification"},
-    "lesion.calcification details.type details": {"calcification"},
-    "lesion.calcification details.distribution": {"calcification"},
+    "lesion.mass details.shape": {MASS},
+    "lesion.mass details.margin": {MASS},
+    "lesion.mass details.density": {MASS},
+    "lesion.mass details.echo pattern": {MASS},
+    "lesion.mass details.posterior features": {MASS},
+    "lesion.mass details.echogenic feature": {MASS},
+    "lesion.calcification details.type": {CALCIFICATION},
+    "lesion.calcification details.type details": {CALCIFICATION},
+    "lesion.calcification details.distribution": {CALCIFICATION},
 }
 
 
+def validate_specs() -> None:
+    """Guard the invariants the generator relies on. Called at import time."""
+    problems = []
+    for field_id, spec in FIELD_SPECS_BY_ID.items():
+        allowed = MODALITY_RULES.get(field_id)
+        if allowed and isinstance(spec.answer_space, dict):
+            missing = allowed - set(spec.answer_space)
+            if missing:
+                problems.append(
+                    f"{field_id}: no answer space for modality {sorted(missing)}"
+                )
+        if spec.scope == "lesion" and "{referent}" not in " ".join(spec.templates):
+            if field_id not in {"lesion.count"}:
+                problems.append(
+                    f"{field_id}: per-finding templates need a {{referent}}"
+                )
+        if spec.solo_templates and "{referent}" in " ".join(spec.solo_templates):
+            problems.append(f"{field_id}: solo templates must not take a {{referent}}")
+    for field_id in set(MODALITY_RULES) | set(LESION_TYPE_RULES):
+        if field_id not in FIELD_SPECS_BY_ID:
+            problems.append(f"{field_id}: rule refers to a field with no FieldSpec")
+    if problems:
+        raise AssertionError("Invalid field specs:\n  " + "\n  ".join(problems))
+
+
+validate_specs()
+
+
+# ===========================================================================
+# NEGATIVE (INAPPLICABLE-QUESTION) CANDIDATES
+# ===========================================================================
 @dataclass(frozen=True)
 class NegativeCandidate:
     field_id: str
     case: NegativeCase
     answer: str
+    referent: str | None = None
 
 
 def get_negative_candidates(
-    field_specs_by_id: dict[str, FieldSpec],
-    modality: str,
-    lesions_present: int,  # 0 for unknown (in which we do not ask lesion questions), 1 for present, -1 for absent
-    lesion_type: str,
+        field_specs_by_id: dict[str, FieldSpec],
+        modality: str,
+        lesion_status: str,
+        lesion_types: tuple[str, ...] = (),
 ) -> list[NegativeCandidate]:
     candidates: list[NegativeCandidate] = []
+    present_types = set(lesion_types)
 
-    for field_id, fs in field_specs_by_id.items():
-        neg_templates = fs.negative_response_templates
+    for field_id, spec in field_specs_by_id.items():
+        neg_templates = spec.negative_response_templates
         if not neg_templates:
             continue
 
         reasons: list[NegativeCase] = []
 
-        # 1) wrong modality
         allowed_modalities = MODALITY_RULES.get(field_id)
-        if allowed_modalities is not None and modality not in allowed_modalities and "wrong_modality" in neg_templates:
+        if (
+                allowed_modalities is not None
+                and modality not in allowed_modalities
+                and "wrong_modality" in neg_templates
+        ):
             reasons.append("wrong_modality")
 
-        # 2) lesion-specific inapplicability
         allowed_lesion_types = LESION_TYPE_RULES.get(field_id)
         if allowed_lesion_types is not None:
-            if lesions_present == 0:
-                continue  # if lesion status is unknown, we do not add negative candidates for lesion-specific fields, as we don't know if they are applicable or not
-            if lesions_present == -1:
+            if lesion_status == "unknown":
+                continue
+            if lesion_status == "absent":
                 if "no_lesion" in neg_templates:
                     reasons.append("no_lesion")
-            else:
-                has_matching_lesion = lesion_type in allowed_lesion_types
-                if not has_matching_lesion:
-                    if "wrong_lesion_type" in neg_templates:
-                        reasons.append("wrong_lesion_type")
-                    elif "no_lesion" in neg_templates:
-                        reasons.append("no_lesion")
+            elif not (present_types & allowed_lesion_types):
+                if "wrong_lesion_type" in neg_templates:
+                    reasons.append("wrong_lesion_type")
+                elif "no_lesion" in neg_templates:
+                    reasons.append("no_lesion")
 
         for case in reasons:
             candidates.append(
                 NegativeCandidate(
-                    field_id=field_id,
-                    case=case,
-                    answer=neg_templates[case],
+                    field_id=field_id, case=case, answer=neg_templates[case]
                 )
             )
 
@@ -457,22 +676,17 @@ def get_negative_candidates(
 
 
 def sample_negative_candidates_one_per_field(
-    rng,
-    candidates: list[NegativeCandidate],
-    k: int,
+        rng,
+        candidates: list[NegativeCandidate],
+        k: int,
 ) -> list[NegativeCandidate]:
     by_field: dict[str, list[NegativeCandidate]] = defaultdict(list)
-    for c in candidates:
-        by_field[c.field_id].append(c)
+    for candidate in candidates:
+        by_field[candidate.field_id].append(candidate)
 
-    field_ids = list(by_field)
+    field_ids = sorted(by_field)
     if not field_ids:
         return []
 
     chosen_fields = rng.sample(field_ids, k=min(k, len(field_ids)))
-
-    sampled: list[NegativeCandidate] = []
-    for field_id in chosen_fields:
-        sampled.append(rng.choice(by_field[field_id]))
-
-    return sampled
+    return [rng.choice(by_field[field_id]) for field_id in chosen_fields]

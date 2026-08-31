@@ -1,29 +1,28 @@
 import json
 from dataclasses import asdict, dataclass
-from typing import Optional
 
 from utils.preprocessing import sanitize_string
 
 
 @dataclass
 class PatientContext:
-    age: Optional[str] = None
-    has_implants: Optional[str] = None
+    age: str | None = None
+    has_implants: str | None = None
 
 
 @dataclass
 class ExamContext:
-    modality: Optional[str] = None  # mg, us, mr
-    laterality: Optional[str] = None  # left, right, bilateral
-    view: Optional[str] = None  # cranial caudal, mediolateral oblique, etc.
-    contrast_phase: Optional[str] = None  # pre-contrast, post-contrast, etc.
+    modality: str | None = None  # mg, us, mr
+    laterality: str | None = None  # left, right, bilateral
+    view: str | None = None  # cranial caudal, mediolateral oblique, etc.
+    contrast_phase: str | None = None  # pre-contrast, post-contrast, etc.
 
 
 class JSONReportContext:
     def __init__(
-        self,
-        patient_context: Optional[PatientContext] = None,
-        exam_context: Optional[ExamContext] = None,
+            self,
+            patient_context: PatientContext | None = None,
+            exam_context: ExamContext | None = None,
     ) -> None:
         self.patient_context = patient_context
         self.exam_context = exam_context

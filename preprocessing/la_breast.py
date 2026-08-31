@@ -3,33 +3,40 @@ import os
 import uuid
 from functools import partial
 from glob import glob
-from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from dtos.breast_cancer_dataset import (
+    ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext
-from dtos.json_report_findings import Assessment, BreastFindings, JSONReportFindings
+from dtos.json_report_findings import (
+    SCOPE_UNKNOWN,
+    Assessment,
+    BreastFindings,
+    JSONReportFindings,
+)
+from utils.error_handling import pool_worker
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
     BILATERAL,
+    BIRADS_MAPPING,
+    MRI,
     NOT_PRESENT,
-    birads_assessment,
-    birads_mapping,
-    breast_density,
+    PRESENT,
+    UNKNOWN,
+    collapse_known_biopsy_proven,
     column_cleaning_csv_reading,
     draw_rectangle_on_image,
     get_proper_birads,
-    get_proper_breast_density,
     get_proper_contrast_phase,
-    get_value,
+    get_proper_mri_fgt,
     isna_v2,
+    map_birads,
     read_breast_image,
 )
 
@@ -43,9 +50,8 @@ csv_save_path: str = "../data/processed/la-breast/la-breast.csv"
 
 
 class LABreast(BreastCancerDataset):
-
-    _modality = "mr"
-    _race = "latin american"
+    _modality = MRI
+    _race = UNKNOWN
     _machine = "Multiple 1.5T scanners"
     SEQUENCE_COLUMNS = ["d0", "d1", "d2", "d3", "d4", "d5"]
 
@@ -55,7 +61,7 @@ class LABreast(BreastCancerDataset):
             raw_imgs_path=raw_imgs_path,
             processed_imgs_path=processed_imgs_path,
             image_preprocessing_config=ImagePreprocessingConfig(
-                read_func=partial(read_breast_image)
+                modality=MRI, read_func=partial(read_breast_image)
             ),
         )
 
@@ -69,26 +75,27 @@ class LABreast(BreastCancerDataset):
     def process_info(self):
         # 1. Adjust the birads values
         self.clinical_df["birads"] = self.clinical_df["birads"].apply(
-            lambda x: get_value(x, birads_assessment)
+            lambda x: map_birads(x, source="LA-Breast", modality=MRI)
         )
 
         # 2. Move birads 6 values to birads 5
-        self.clinical_df["birads"] = self.clinical_df["birads"].replace(
-            birads_mapping[6], birads_mapping[5]
+        self.clinical_df["birads"] = self.clinical_df["birads"].apply(
+            collapse_known_biopsy_proven
         )
 
-        # 3. Adjust breast density values
-        self.clinical_df["acr"] = self.clinical_df["acr"].apply(
-            lambda x: get_value(int(x), breast_density) if pd.notna(x) else None
-        )
+        # 3. Drop rows we cannot assess. process_patient calls get_proper_birads,
+        # which raises on an unmappable value and would take the whole pool down.
+        unmappable = int(self.clinical_df["birads"].isna().sum())
+        if unmappable:
+            logging.warning(
+                f"LA-Breast: dropping {unmappable} rows with an unmappable BI-RADS."
+            )
+        self.clinical_df = self.clinical_df[
+            self.clinical_df["birads"].notna()
+        ].reset_index(drop=True)
 
         # column renameing
-        self.clinical_df.rename(
-            columns={
-                "acr": "breast density",
-            },
-            inplace=True,
-        )
+        self.clinical_df.rename(columns={"acr": "breast density"}, inplace=True)
 
         # drop columns that are not useful as images:
         keep_cols = [
@@ -143,24 +150,11 @@ class LABreast(BreastCancerDataset):
         # Split deduplicated DataFrame by patient id
         grouped_patients = [group for _, group in dedup_df.groupby("patient")]
 
-        # Process the exams
-        n = cpu_count() - 1
-        with Pool(processes=n) as p:
-            results = list(
-                tqdm(
-                    p.imap(self.process_patient, grouped_patients),
-                    total=len(grouped_patients),
-                    desc="Processing LA Breast patients",
-                    unit="patient",
-                    ncols=100,
-                    position=0,
-                    leave=True,
-                )
-            )
-        for result in results:
-            for exam in result:
-                self.append_exam(exam)
+        self.run_pool(
+            self.process_patient, grouped_patients, "Processing LA Breast patients"
+        )
 
+    @pool_worker
     def process_patient(self, patient_df):
         curr_exams = []
 
@@ -189,8 +183,8 @@ class LABreast(BreastCancerDataset):
 
                 for im_path in patient_imgs:
                     if (
-                        curr_type_value.lower() in im_path.lower()
-                        and roi_value in im_path.lower()
+                            curr_type_value.lower() in im_path.lower()
+                            and roi_value in im_path.lower()
                     ):
                         dx = row.get(f"distancia x {im_type}")
                         dy = row.get(f"distancia y {im_type}")
@@ -200,21 +194,28 @@ class LABreast(BreastCancerDataset):
                         exam_id = str(uuid.uuid4())
                         patient_id = f"{self.get_dataset_name()}-{row['patient']}"
 
-                        exam_imgs_path, img_shape = self.process_and_save_slice(
-                            im_path, exam_id, patient_id
-                        )
-                        segmentation_path = (
-                            self.create_and_save_segmentation(
-                                exam_id, patient_id, img_shape, (dx, dy, cx, cy)
-                            )
-                            if not isna_v2(exam_imgs_path)
-                            else None
-                        )
-
-                        if isna_v2(exam_imgs_path) or isna_v2(segmentation_path):
+                        processed_img, img_shape = self.process_slice(im_path)
+                        if processed_img is None:
                             logging.warning(
-                                f"Skipping exam for patient {patient} because of processing issues. "
-                                f"Exams imgs path: {exam_imgs_path}, Segmentation path: {segmentation_path}"
+                                f"Skipping exam for patient {patient}: could not process {im_path}."
+                            )
+                            continue
+
+                        segmentation_path = self.create_and_save_segmentation(
+                            exam_id, patient_id, img_shape, (dx, dy, cx, cy)
+                        )
+                        if isna_v2(segmentation_path):
+                            logging.warning(
+                                f"Skipping exam for patient {patient}: no usable ROI for {im_path}."
+                            )
+                            continue
+
+                        exam_imgs_path = self.image_processor.save_image_set(
+                            [processed_img], exam_id, patient_id
+                        )
+                        if isna_v2(exam_imgs_path):
+                            logging.warning(
+                                f"Skipping exam for patient {patient}: could not save {im_path}."
                             )
                             continue
 
@@ -226,18 +227,21 @@ class LABreast(BreastCancerDataset):
                             ),
                         )
 
-                        findings = JSONReportFindings(
+                        assessment_birads = get_proper_birads(
+                            row["birads"], modality=MRI
+                        )
+
+                        findings = JSONReportFindings.build(
                             breast=BreastFindings(
-                                density=get_proper_breast_density(row["breast density"])
+                                fgt=get_proper_mri_fgt(row["breast density"])
                             ),
                             lesion=(
                                 NOT_PRESENT
-                                if row["birads"] == birads_mapping[1]
-                                else None
+                                if row["birads"] == BIRADS_MAPPING[1]
+                                else PRESENT
                             ),
-                            assessment=Assessment(
-                                birads=get_proper_birads(row["birads"])
-                            ),
+                            assessment=Assessment(birads=assessment_birads),
+                            annotation_scope=SCOPE_UNKNOWN,
                         )
 
                         exam = ExamInformation(
@@ -245,7 +249,7 @@ class LABreast(BreastCancerDataset):
                             patient=patient_id,
                             dataset=self.get_dataset_name(),
                             modality=self._modality,
-                            birads=get_proper_birads(row["birads"]),
+                            birads=assessment_birads,
                             race=self._race,
                             machine=self._machine,
                             exam=exam_imgs_path,
@@ -256,6 +260,9 @@ class LABreast(BreastCancerDataset):
                             ),
                             context=context.get_string(),
                             findings=findings.get_string(),
+                            exam_id=patient_id,
+                            breast_id=None,  # bilateral acquisition
+                            assessment_scope=ASSESSMENT_GROUNDED,
                         )
                         curr_exams.append(exam)
 
@@ -270,7 +277,7 @@ class LABreast(BreastCancerDataset):
 
         return curr_exams
 
-    def process_and_save_slice(self, file_path, exam_id, patient_id):
+    def process_slice(self, file_path):
         img = self.image_processor.read_image(file_path)
 
         if isna_v2(img):
@@ -284,34 +291,66 @@ class LABreast(BreastCancerDataset):
             logging.warning(f"Could not process image for {file_path}")
             return None, None
 
-        img_save_path = self.image_processor.save_image_set([img], exam_id, patient_id)
-        return img_save_path, img_shape
+        return img, img_shape
 
     def create_and_save_segmentation(self, exam_id, patient_id, img_shape, coordinates):
         dx, dy, cx, cy = coordinates
 
-        mask = np.zeros(img_shape, dtype=np.uint16)
+        if any(isna_v2(v) for v in (dx, dy, cx, cy)):
+            logging.warning(
+                f"Missing ROI coordinates for patient {patient_id}, exam {exam_id}."
+            )
+            return None
+
+        height, width = img_shape
+        # cv2 takes (x=column, y=row); `centro x`/`distancia x` are column-space.
         x1, y1 = int(cx - dx / 2), int(cy - dy / 2)
         x2, y2 = int(cx + dx / 2), int(cy + dy / 2)
-        draw_rectangle_on_image(mask, x1, y1, x2, y2)
+
+        # A box that lands entirely outside the frame would otherwise be written
+        # out as a valid-looking, wholly empty annotation.
+        if x2 <= 0 or y2 <= 0 or x1 >= width or y1 >= height:
+            logging.warning(
+                f"ROI box ({x1},{y1})-({x2},{y2}) falls outside the {img_shape} frame "
+                f"for patient {patient_id}, exam {exam_id}."
+            )
+            return None
+
+        # draw_rectangle_on_image returns a copy; ignoring it leaves an empty mask.
+        mask = draw_rectangle_on_image(
+            np.zeros(img_shape, dtype=np.uint8), x1, y1, x2, y2
+        )
+        if mask is None or mask.max() == 0:
+            logging.warning(
+                f"ROI box ({x1},{y1})-({x2},{y2}) produced an empty mask for patient "
+                f"{patient_id}, exam {exam_id}."
+            )
+            return None
 
         seg_mask = self.image_processor.apply_processing(mask, is_segmentation=True)
-        seg_mask_path = self.image_processor.save_segmentation_set(
+        return self.image_processor.save_segmentation_set(
             [seg_mask], exam_id, patient_id
         )
-        return seg_mask_path
 
     def _sample_one_row_per_clinical_group(
-        self, df: pd.DataFrame, random_state: int = 42
+            self, df: pd.DataFrame, random_state: int = 42
     ) -> pd.DataFrame:
         # Keep one random representative row per (patient, birads, breast density)
         if len(df) == 0:
             return df.copy()
 
+        # `breast density` is missing on a fifth of the rows. GroupBy.sample cannot
+        # index a group whose key contains NaN even with dropna=False, so the key is
+        # materialised as text with an explicit placeholder first.
+        group_key = (
+            df[["patient", "birads", "breast density"]]
+            .astype(object)
+            .apply(lambda col: col.map(lambda v: "<missing>" if isna_v2(v) else str(v)))
+            .agg("\x1f".join, axis=1)
+        )
+
         sampled = (
-            df.groupby(
-                ["patient", "birads", "breast density"], dropna=False, group_keys=False
-            )
+            df.groupby(group_key, sort=False, group_keys=False)
             .sample(n=1, random_state=random_state)
             .reset_index(drop=True)
         )

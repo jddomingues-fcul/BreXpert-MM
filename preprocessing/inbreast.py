@@ -2,21 +2,23 @@ import glob
 import logging
 import os
 import plistlib
+import re
 import uuid
-from multiprocessing import Pool, cpu_count
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 from skimage.draw import polygon
-from tqdm import tqdm
 
 from dtos.breast_cancer_dataset import (
+    ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
-from dtos.json_report_context import ExamContext, JSONReportContext
+from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
 from dtos.json_report_findings import (
+    SCOPE_INDEX_ONLY,
     Assessment,
     BreastFindings,
     JSONReportFindings,
@@ -25,13 +27,14 @@ from dtos.json_report_findings import (
 from utils.error_handling import trycatch_func
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
+    BIRADS_MAPPING,
     CALCIFICATION,
+    MAMMOGRAPHY,
     MASS,
     NOT_PRESENT,
     UNKNOWN,
-    birads_assessment,
-    birads_mapping,
-    breast_density,
+    bin_age,
+    collapse_known_biopsy_proven,
     csv_column_cleaning,
     dview,
     get_proper_birads,
@@ -39,12 +42,15 @@ from utils.preprocessing import (
     get_proper_exam_view,
     get_value,
     isna_v2,
-    laterality,
+    map_birads,
+    normalize_laterality,
     yes_no_mapping,
 )
 
-raw_imgs_path = "../data/raw/inbreast/AllDICOMs"  # NOTE: there will not be more than 1 image per patient
+raw_imgs_path = "../data/raw/inbreast/AllDICOMs"
 raw_imgs_extension = ".dcm"
+FILENAME_RE = re.compile(r"^(?P<file_id>\d+)_(?P<patient_hash>[0-9a-fA-F]{8,})_")
+NON_LESION_ROI_NAMES = ("pectoral", "nipple", "skin")
 segmentations_xml_folder = "../data/raw/inbreast/AllXML"
 raw_segs_extension = ".xml"
 clinical_data_path = "../data/raw/inbreast/INbreast.xls"
@@ -53,7 +59,7 @@ csv_save_path = "../data/processed/inbreast/inbreast.csv"
 
 
 class Inbreast(BreastCancerDataset):
-    _modality = "mg"
+    _modality = MAMMOGRAPHY
     _machine = UNKNOWN
     _race = UNKNOWN
 
@@ -62,7 +68,7 @@ class Inbreast(BreastCancerDataset):
         self.image_processor = ImageProcessor(
             raw_imgs_path=raw_imgs_path,
             processed_imgs_path=processed_imgs_path,
-            image_preprocessing_config=ImagePreprocessingConfig(),
+            image_preprocessing_config=ImagePreprocessingConfig(modality=MAMMOGRAPHY),
         )
 
         self.clinical_df = pd.read_excel(clinical_data_path)
@@ -76,27 +82,24 @@ class Inbreast(BreastCancerDataset):
         self.clinical_df["file name"] = self.clinical_df["file name"].apply(
             lambda x: str(int(x))
         )
-        self.clinical_df["acr"] = self.clinical_df["acr"].apply(
-            lambda x: get_value(x, breast_density)
-        )  # the empty strings will be converted to None
         self.clinical_df["lesion annotation status"] = self.clinical_df[
             "lesion annotation status"
         ].apply(lambda x: str(x).strip().lower() if pd.notna(x) else None)
 
         self.clinical_df["laterality"] = self.clinical_df["laterality"].apply(
-            lambda x: get_value(x, laterality)
+            normalize_laterality
         )
         self.clinical_df["view"] = self.clinical_df["view"].apply(
             lambda x: get_value(x, dview)
         )
         self.clinical_df = self.clinical_df[
             self.clinical_df["view"] != "from below"
-        ].reset_index(
+            ].reset_index(
             drop=True
         )  # only one exam with this view, and it's not clear what it means, so dropping it
 
         self.clinical_df["bi-rads"] = self.clinical_df["bi-rads"].apply(
-            lambda x: get_value(x, birads_assessment)
+            lambda x: map_birads(x, source="INbreast", modality=MAMMOGRAPHY)
         )
         self.clinical_df["mass"] = self.clinical_df["mass"].apply(
             lambda x: get_value(x, yes_no_mapping) if pd.notna(x) else None
@@ -125,8 +128,8 @@ class Inbreast(BreastCancerDataset):
         )
 
         # move birads 6 (known biopsy proven) to birads 5
-        self.clinical_df["bi-rads"] = self.clinical_df["bi-rads"].replace(
-            {birads_mapping[6]: birads_mapping[5]}
+        self.clinical_df["bi-rads"] = self.clinical_df["bi-rads"].apply(
+            collapse_known_biopsy_proven
         )
 
         # fill mass, micros, distortion, asymmetry nan values with "no"
@@ -135,15 +138,18 @@ class Inbreast(BreastCancerDataset):
             inplace=True,
         )
 
-        # filter for cases where we either have a mass or microcalcifications, but not both at the same time, and no to distortion and asymmetry
+        # Keep the cases whose finding we can state unambiguously: at most one of
+        # mass / microcalcifications, so the lesion type is never in doubt. Rows
+        # with neither are genuine normals and are exactly the negative evidence
+        # the corpus needs.
+        has_mass = self.clinical_df["mass"] == "yes"
+        has_micros = self.clinical_df["micros"] == "yes"
+
         self.clinical_df = self.clinical_df[
-            (
-                (self.clinical_df["mass"] == "yes")
-                ^ (self.clinical_df["micros"] == "yes")
-            )
+            ~(has_mass & has_micros)
             & (self.clinical_df["distortion"] == "no")
             & (self.clinical_df["asymmetry"] == "no")
-        ].reset_index(drop=True)
+            ].reset_index(drop=True)
 
         # column renameing
         self.clinical_df.rename(
@@ -155,44 +161,15 @@ class Inbreast(BreastCancerDataset):
             inplace=True,
         )
 
-        # Process the exams
-        n = cpu_count() - 1
-        df_split = [
-            self.clinical_df.iloc[idx]
-            for idx in np.array_split(np.arange(len(self.clinical_df)), n)
-            if len(idx) > 0
-        ]
-        with Pool(processes=n) as p:
-            results = p.map(self.process_small_batch, df_split)
+        # Establish the grouping key used for patient-disjoint splitting
+        self.resolve_patient_id()
 
-        for result in results:
-            for exam in result:
-                self.append_exam(exam)
-
-    @trycatch_func
-    def process_small_batch(self, df):
-        curr_exams = []
-
-        # Im sorry
-        with tqdm(
-            total=len(df),
-            desc=f"Processing INBreast batch {df.index[0]} to {df.index[-1]}",
-            unit="exam",
-            ncols=100,
-            position=0,
-            leave=True,
-        ) as pbar:
-            for _, row in df.iterrows():
-                exam = self.process_row(row)
-                pbar.update(1)
-                if not isna_v2(exam):
-                    curr_exams.append(exam)
-        return curr_exams
+        self.run_row_pool(self.clinical_df)
 
     @trycatch_func
     def process_row(self, row):
         exam_id = str(uuid.uuid4())
-        patient_id = f"{self.get_dataset_name()}-{row['file name']}"
+        patient_id = f"{self.get_dataset_name()}-{row['patient key']}"
 
         exam_imgs_path, img_shape = self.find_and_save_slice(
             row["file name"], exam_id, patient_id
@@ -213,6 +190,7 @@ class Inbreast(BreastCancerDataset):
 
         # construct context
         context = JSONReportContext(
+            patient_context=PatientContext(age=bin_age(row.get("patient age"))),
             exam_context=ExamContext(
                 modality=self._modality,
                 laterality=row["laterality"],
@@ -221,16 +199,19 @@ class Inbreast(BreastCancerDataset):
         )
 
         # construct final exam info
-        findings = JSONReportFindings(
+        assessment_birads = get_proper_birads(row["bi-rads"], modality=MAMMOGRAPHY)
+
+        findings = JSONReportFindings.build(
             breast=BreastFindings(
-                density=get_proper_breast_density(row["breast density"])
+                composition=get_proper_breast_density(row["breast density"])
             ),
             lesion=(
                 NOT_PRESENT
-                if row["bi-rads"] == birads_mapping[1]
+                if row["bi-rads"] == BIRADS_MAPPING[1]
                 else self.get_simple_lesion(row)
             ),
-            assessment=Assessment(birads=get_proper_birads(row["bi-rads"])),
+            assessment=Assessment(birads=assessment_birads),
+            annotation_scope=SCOPE_INDEX_ONLY,
         )
 
         return ExamInformation(
@@ -238,7 +219,7 @@ class Inbreast(BreastCancerDataset):
             patient=patient_id,
             dataset=self.get_dataset_name(),
             modality=self._modality,
-            birads=get_proper_birads(row["bi-rads"]),
+            birads=assessment_birads,
             race=self._race,
             machine=self._machine,
             exam=exam_imgs_path,
@@ -247,15 +228,81 @@ class Inbreast(BreastCancerDataset):
             ),
             context=context.get_string(),
             findings=findings.get_string(),
+            exam_id=patient_id,
+            breast_id=f"{patient_id}-{row['laterality']}",
+            assessment_scope=ASSESSMENT_GROUNDED,
         )
 
     def get_simple_lesion(self, row):
         if row["mass"] == "yes":
-            return Lesion(type=MASS)
+            return Lesion(finding_type=MASS)
         elif row["has microcalcifications"] == "yes":
-            return Lesion(type=CALCIFICATION)
-        else:
-            return NOT_PRESENT
+            return Lesion(finding_type=CALCIFICATION)
+        return NOT_PRESENT
+
+    @staticmethod
+    def build_patient_hash_index() -> dict[str, str]:
+        index: dict[str, str] = {}
+        for path in glob.glob(
+                f"{raw_imgs_path}/**/*{raw_imgs_extension}", recursive=True
+        ):
+            match = FILENAME_RE.match(os.path.basename(path))
+            if match:
+                index[match.group("file_id")] = match.group("patient_hash")
+
+        if not index:
+            return {}
+
+        distinct = len(set(index.values()))
+        if distinct >= len(index):
+            logging.warning(
+                f"INbreast: the DICOM filename hash is unique per image "
+                f"({distinct} hashes for {len(index)} images), so it does not identify patients."
+            )
+            return {}
+
+        group_sizes = Counter(Counter(index.values()).values())
+        logging.info(
+            f"INbreast: recovered {distinct} patient hashes for {len(index)} images "
+            f"(images per patient: {dict(sorted(group_sizes.items()))})."
+        )
+        return index
+
+    def resolve_patient_id(self) -> None:
+        raw_ids = self.clinical_df["patient id"].astype(str).str.strip().str.lower()
+        unusable = raw_ids.isin({"removed", "nan", "", "none"})
+
+        if unusable.all():
+            hashes = self.build_patient_hash_index()
+            recovered = self.clinical_df["file name"].map(hashes)
+
+            if recovered.notna().all():
+                logging.info(
+                    "INbreast: 'patient id' is redacted in this release; grouping by the "
+                    "per-patient hash in the DICOM filenames instead."
+                )
+                self.clinical_df["patient key"] = recovered
+                return
+
+            logging.warning(
+                "INbreast: the 'patient id' column is redacted in this release and the "
+                "DICOM filenames yield no usable patient hash "
+                f"({int(recovered.isna().sum())} of {len(recovered)} rows unmatched), so each "
+                "image is treated as its own patient. Views of the same woman can therefore "
+                "land in different splits -- record this limitation alongside any results."
+            )
+            self.clinical_df["patient key"] = self.clinical_df["file name"]
+            return
+
+        if unusable.any():
+            logging.warning(
+                f"INbreast: {int(unusable.sum())} rows have no usable patient id; "
+                "falling back to the file name for those rows only."
+            )
+
+        self.clinical_df["patient key"] = np.where(
+            unusable, self.clinical_df["file name"], self.clinical_df["patient id"]
+        )
 
     def find_and_save_slice(self, file_name, exam_id, patient_id):
         available_imgs = sorted(
@@ -265,7 +312,9 @@ class Inbreast(BreastCancerDataset):
             )
         )
         available_imgs = [
-            img for img in available_imgs if str(file_name) in os.path.basename(img)
+            img
+            for img in available_imgs
+            if os.path.basename(img).startswith(f"{file_name}_")
         ]
         if len(available_imgs) == 0:
             logging.warning(f"Could not find image for {file_name}")
@@ -297,7 +346,9 @@ class Inbreast(BreastCancerDataset):
         search_path = f"{segmentations_xml_folder}/**/*{raw_segs_extension}"
         available_imgs = sorted(glob.glob(search_path, recursive=True))
         available_imgs = [
-            img for img in available_imgs if str(file_name) in os.path.basename(img)
+            img
+            for img in available_imgs
+            if os.path.splitext(os.path.basename(img))[0] == str(file_name)
         ]
 
         if len(available_imgs) == 0:
@@ -324,8 +375,8 @@ class Inbreast(BreastCancerDataset):
         )
         return seg_mask_path
 
-    @trycatch_func
     @staticmethod
+    @trycatch_func
     def load_inbreast_mask(mask_path, imshape):
         # taken from: https://www.kaggle.com/code/lethanhnghia/breastcancercnn
         def load_point(point_string):
@@ -339,6 +390,13 @@ class Inbreast(BreastCancerDataset):
             rois = plist_dict["ROIs"]
             assert len(rois) == numRois
             for roi in rois:
+                roi_name = str(roi.get("Name", "")).strip().lower()
+                if any(skip in roi_name for skip in NON_LESION_ROI_NAMES):
+                    logging.debug(
+                        f"Skipping '{roi_name}' ROI in {os.path.basename(mask_path)}."
+                    )
+                    continue
+
                 numPoints = roi["NumberOfPoints"]
                 points = roi["Point_px"]
                 assert numPoints == len(points)

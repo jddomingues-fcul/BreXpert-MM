@@ -42,3 +42,18 @@ def trycatch_func(func):
             return None
 
     return wrapper
+
+
+def pool_worker(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        from utils.preprocessing import drain_unmapped_counts
+
+        try:
+            result = func(*args, **kwargs)
+        except Exception as e:
+            logging.error(f"Error in pool worker {func.__name__}: {e}")
+            result = None
+        return result, drain_unmapped_counts()
+
+    return wrapper

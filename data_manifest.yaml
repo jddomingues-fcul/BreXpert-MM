@@ -1,11 +1,32 @@
 # BreXpert-MM Reconstruction Manifest
 
-# Update `pipeline.git_commit` and each source's `version` / `version_evidence` whenever you rebuild the dataset or re-pull a source.
-# Include this file whenever reporting results from this dataset.
-
 pipeline:
-  git_commit: b02b4a1074102e268b8cfe00b3b81d8184c8ae0f
+  git_commit: 46e791e2d27a45f3a2b7525a9a226eb6b58deaf5
   robust_vqa: true
+  lexicon: ACR BI-RADS v2025 (6th edition)
+  canvas_order: [width, height]
+  canvases:
+    mammography: [784, 1120]
+    ultrasound: [672, 560]
+    mri: [560, 560]
+  findings_schema: multi-finding (lesions[], lesion_status, annotation_scope)
+  assessment_scopes: [grounded, exam_level, derived]
+  split:
+    val_frac: 0.10
+    test_frac: 0.20
+    seed: 42
+    frozen_splits: patient_splits.csv
+  vqa:
+    max_turns: 16
+    train:
+      context_dropout: 0.5
+      shuffle_context: true
+      shuffle_questions: true
+      add_negative_examples_prob: 0.5
+      negative_examples_k: 5
+      multiple_choice_prob: 0.25
+    validation_and_test:
+      eval_preset: true
 
 sources:
 - slug: advanced-mri-lesions
@@ -19,11 +40,14 @@ sources:
 - slug: breast-micro-calc
   download_url: https://zenodo.org/records/5036062
   license: CC BY 4.0
-  version: Verson 2 - Updated 2021/06/30
-- slug: bus-bra
-  download_url: https://zenodo.org/records/8231412
+  version: Version 2 - Updated 2021/06/30
+- slug: bus-cot
+  download_url: https://doi.org/10.6084/m9.figshare.30838715
   license: CC BY 4.0
-  version: Version 1 - Updated 2023/03/13
+  version: Version 1 - Updated 2025/12/09
+  notes: >-
+    every lesion in the us_report block is kept; previously only the main
+    lesion was retained
 - slug: cbis-ddsm
   download_url: https://www.cancerimagingarchive.net/collection/cbis-ddsm/
   license: CC BY 3.0
@@ -36,6 +60,7 @@ sources:
   download_url: https://www.kaggle.com/datasets/martholi/inbreast
   license: unknown
   version: Version 1 - Updated 2020/04/18
+  notes: patient id redacted in this release
 - slug: la-breast
   download_url: https://data.mendeley.com/datasets/8rzyn3ng9c/1
   license: CC BY 4.0
@@ -48,10 +73,6 @@ sources:
   download_url: https://zenodo.org/records/545928
   license: CC BY-NC 4.0
   version: Version 1 - Updated 2017/08/31
-- slug: rsna-bcd
-  download_url: https://registry.opendata.aws/rsna-screening-mammography-breast-cancer-detection/
-  license: non-commercial
-  version: Version 1 - Updated 2023/02/27
 - slug: tompei-cmmd
   download_url: https://www.cancerimagingarchive.net/analysis-result/tompei-cmmd/
   license: CC BY 4.0

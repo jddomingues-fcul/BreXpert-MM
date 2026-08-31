@@ -1,5 +1,6 @@
 out/
 *.bin
+.idea/
 
 logs/*.csv
 

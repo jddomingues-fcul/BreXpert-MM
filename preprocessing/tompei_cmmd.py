@@ -4,52 +4,51 @@ import re
 import uuid
 from functools import partial
 from glob import glob
-from multiprocessing import Pool, cpu_count
-from typing import Optional
 
-import numpy as np
 import pandas as pd
-from tqdm import tqdm
+import pydicom as dicom
 
 from dtos.breast_cancer_dataset import (
+    ASSESSMENT_EXAM_LEVEL,
     BreastCancerDataset,
     ExamInformation,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
 from dtos.json_report_findings import (
+    SCOPE_COMPLETE,
     Assessment,
     BreastFindings,
     CalcificationAbnormality,
     JSONReportFindings,
     Lesion,
+    LesionLocation,
     MassAbnormality,
 )
+from utils.error_handling import trycatch_func
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
+    BIRADS_MAPPING,
     CALCIFICATION,
-    CRANIAL_CAUDAL,
+    MAMMOGRAPHY,
     MASS,
-    MEDIOLATERAL_OBLIQUE,
     NOT_PRESENT,
     abbreviation_mapping,
     bin_age,
-    birads_assessment,
-    birads_mapping,
     convert_dcm_image,
     get_proper_birads,
     get_proper_breast_density,
     get_proper_calcification_distribution,
     get_proper_calcification_type,
+    get_proper_exam_view,
     get_proper_location,
     get_proper_mass_density,
-    get_proper_mass_margin,
-    get_proper_mass_shape,
     get_value,
     isna_v2,
-    laterality,
+    map_birads,
+    migrate_mammography_microlobulated,
+    normalize_laterality,
     region_mapping,
-    sanitize_age,
 )
 
 raw_imgs_path = "../data/raw/tompei-cmmd/cmmd"
@@ -60,7 +59,7 @@ csv_save_path = "../data/processed/tompei-cmmd/tompei-cmmd.csv"
 
 
 class TompeiCMMD(BreastCancerDataset):
-    _modality = "mg"
+    _modality = MAMMOGRAPHY
     _machine = "GE Senographe DS mammography system"
     _race = "asian"
 
@@ -70,7 +69,8 @@ class TompeiCMMD(BreastCancerDataset):
             raw_imgs_path=raw_imgs_path,
             processed_imgs_path=processed_imgs_path,
             image_preprocessing_config=ImagePreprocessingConfig(
-                read_func=partial(convert_dcm_image)
+                modality=MAMMOGRAPHY,
+                read_func=partial(convert_dcm_image),
             ),
         )
 
@@ -132,10 +132,10 @@ class TompeiCMMD(BreastCancerDataset):
 
         # Adjust processing for clarity
         self.clinical_data["laterality"] = self.clinical_data["laterality"].apply(
-            lambda x: get_value(x, laterality) if not isna_v2(x) else None
+            normalize_laterality
         )
         self.clinical_data["birads"] = self.clinical_data["birads"].apply(
-            lambda x: get_value(x, birads_assessment)
+            lambda x: map_birads(x, source="TOMPEI-CMMD", modality=MAMMOGRAPHY)
         )
         self.clinical_data["mass location"] = self.clinical_data["mass location"].apply(
             lambda x: get_value(x, region_mapping) if not isna_v2(x) else None
@@ -188,38 +188,9 @@ class TompeiCMMD(BreastCancerDataset):
         )
         self.clinical_data = self.clinical_data[self.clinical_data["n_images"] == 2]
 
-        # Process the exams
-        n = cpu_count() - 1
-        df_split = [
-            self.clinical_data.iloc[idx]
-            for idx in np.array_split(np.arange(len(self.clinical_data)), n)
-            if len(idx) > 0
-        ]
-        with Pool(processes=n) as p:
-            results = p.map(self.process_small_batch, df_split)
+        self.run_row_pool(self.clinical_data)
 
-        for result in results:
-            for exam in result:
-                for instance in exam:
-                    self.append_exam(instance)
-
-    def process_small_batch(self, df):
-        curr_exams = []
-
-        with tqdm(
-            total=len(df),
-            desc=f"Processing cmmd batch {df.index[0]} to {df.index[-1]}",
-            unit="exam",
-            ncols=100,
-            position=0,
-            leave=True,
-        ) as pbar:
-            for _, row in df.iterrows():
-                exams = self.process_row(row)
-                pbar.update(1)
-                curr_exams.append(exams)
-        return curr_exams
-
+    @trycatch_func
     def process_row(self, row):
         out = []
 
@@ -236,11 +207,16 @@ class TompeiCMMD(BreastCancerDataset):
             )
         )
 
-        for i, img_path in enumerate(imgs):
+        for img_path in imgs:
             exam_id = str(uuid.uuid4())
-            exam_imgs_path = self.save_imgs(
-                img_path, f"{exam_id}-{i}", row["patient id"]
-            )
+            view = self.get_view(img_path)
+            if view is None:
+                logging.warning(
+                    f"Could not determine the view for {img_path} (patient {row['patient id']}). Skipping image."
+                )
+                continue
+
+            exam_imgs_path = self.save_imgs(img_path, exam_id, row["patient id"])
 
             if isna_v2(exam_imgs_path):
                 logging.warning(
@@ -250,25 +226,27 @@ class TompeiCMMD(BreastCancerDataset):
 
             # construct context
             context = JSONReportContext(
-                patient_context=PatientContext(age=bin_age(sanitize_age(row["age"]))),
+                patient_context=PatientContext(age=bin_age(row["age"])),
                 exam_context=ExamContext(
                     modality=self._modality,
                     laterality=row["laterality"],
-                    view=CRANIAL_CAUDAL if i == 0 else MEDIOLATERAL_OBLIQUE,
+                    view=view,
                 ),
             )
 
-            # construct final exam info
-            findings = JSONReportFindings(
+            assessment_birads = get_proper_birads(row["birads"], modality=MAMMOGRAPHY)
+
+            findings = JSONReportFindings.build(
                 breast=BreastFindings(
-                    density=get_proper_breast_density(row["breast density"])
+                    composition=get_proper_breast_density(row["breast density"])
                 ),
                 lesion=(
                     NOT_PRESENT
-                    if row["birads"] == birads_mapping[1]
-                    else self._construct_primary_lesion(row)
+                    if row["birads"] == BIRADS_MAPPING[1]
+                    else self._construct_lesions(row)
                 ),
-                assessment=Assessment(birads=get_proper_birads(row["birads"])),
+                assessment=Assessment(birads=assessment_birads),
+                annotation_scope=SCOPE_COMPLETE,
             )
 
             current_exam = ExamInformation(
@@ -276,13 +254,16 @@ class TompeiCMMD(BreastCancerDataset):
                 patient=f"{self.get_dataset_name()}-{row['patient id']}",
                 dataset=self.get_dataset_name(),
                 modality=self._modality,
-                birads=get_proper_birads(row["birads"]),
+                birads=assessment_birads,
                 race=self._race,
                 machine=self._machine,
                 exam=exam_imgs_path,
                 segmentation=None,
                 context=context.get_string(),
                 findings=findings.get_string(),
+                exam_id=f"{self.get_dataset_name()}-{row['patient id']}",
+                breast_id=f"{self.get_dataset_name()}-{row['patient id']}-{row['laterality']}",
+                assessment_scope=ASSESSMENT_EXAM_LEVEL,
             )
 
             out.append(current_exam)
@@ -325,11 +306,13 @@ class TompeiCMMD(BreastCancerDataset):
             ]
         )
         score = (
-            (2 if is_primary else 0)
-            + int(self._has_text(location))
-            + descriptor_count
-            + int(self._has_text(assoc_calc) or self._has_text(assoc_findings))
+                (2 if is_primary else 0)
+                + int(self._has_text(location))
+                + descriptor_count
+                + int(self._has_text(assoc_calc) or self._has_text(assoc_findings))
         )
+
+        mapped_shape, mapped_margin = migrate_mammography_microlobulated(shape, margin)
 
         return {
             "score": score,
@@ -337,18 +320,20 @@ class TompeiCMMD(BreastCancerDataset):
             "descriptor_count": descriptor_count,
             "type_priority": 2,
             "lesion": Lesion(
-                type=MASS,
-                location=get_proper_location(location),
+                finding_type=MASS,
+                location=LesionLocation(
+                    **get_proper_location(location, row.get("laterality"))
+                ),
                 mass_details=MassAbnormality(
-                    shape=get_proper_mass_shape(shape),
-                    margin=get_proper_mass_margin(margin),
+                    shape=mapped_shape,
+                    margin=mapped_margin,
                     density=get_proper_mass_density(density),
                 ),
             ),
         }
 
     def _build_calcification_candidate(
-        self, row, prefix: str, is_primary: bool, associated_col: Optional[str] = None
+            self, row, prefix: str, is_primary: bool, associated_col: str | None = None
     ):
         location_col = f"{prefix}location"
         morphology_col = f"{prefix}morphology"
@@ -379,10 +364,10 @@ class TompeiCMMD(BreastCancerDataset):
             ]
         )
         score = (
-            (2 if is_primary else 0)
-            + int(self._has_text(location))
-            + descriptor_count
-            + int(self._has_text(associated))
+                (2 if is_primary else 0)
+                + int(self._has_text(location))
+                + descriptor_count
+                + int(self._has_text(associated))
         )
 
         calc_type, calc_det = get_proper_calcification_type(morphology)
@@ -392,8 +377,10 @@ class TompeiCMMD(BreastCancerDataset):
             "descriptor_count": descriptor_count,
             "type_priority": 1,
             "lesion": Lesion(
-                type=CALCIFICATION,
-                location=get_proper_location(location),
+                finding_type=CALCIFICATION,
+                location=LesionLocation(
+                    **get_proper_location(location, row.get("laterality"))
+                ),
                 calcification_details=CalcificationAbnormality(
                     type=calc_type,
                     type_details=calc_det,
@@ -402,7 +389,7 @@ class TompeiCMMD(BreastCancerDataset):
             ),
         }
 
-    def _construct_primary_lesion(self, row) -> Optional[Lesion]:
+    def _construct_lesions(self, row) -> list[Lesion] | None:
         candidates = [
             self._build_mass_candidate(row, "mass ", is_primary=True),
             self._build_calcification_candidate(
@@ -425,16 +412,39 @@ class TompeiCMMD(BreastCancerDataset):
         if not valid_candidates:
             return None
 
-        best_candidate = max(
-            valid_candidates,
+        valid_candidates.sort(
             key=lambda c: (
                 c["score"],
                 c["descriptor_count"],
                 c["is_primary"],
                 c["type_priority"],
             ),
+            reverse=True,
         )
-        return best_candidate["lesion"]
+
+        lesions = [candidate["lesion"] for candidate in valid_candidates]
+        lesions[0].is_index = True
+        return lesions
+
+    def get_view(self, img_path: str) -> str | None:
+        try:
+            ds = dicom.dcmread(img_path, stop_before_pixels=True)
+        except Exception as e:
+            logging.warning(f"Could not read DICOM header at {img_path}: {e}")
+            return None
+
+        view = getattr(ds, "ViewPosition", None)
+
+        if not view and "ViewCodeSequence" in ds:
+            try:
+                view = ds.ViewCodeSequence[0].CodeMeaning
+            except Exception:
+                view = None
+
+        if not view:
+            return None
+
+        return get_proper_exam_view(str(view))
 
     def save_imgs(self, image_path: str, exam_id: str, patient_id: str):
         res = self.image_processor.process_image(img_path=image_path)

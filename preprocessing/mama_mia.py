@@ -1,34 +1,47 @@
+import ast
 import logging
 import os
 import uuid
 from functools import partial
-from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
-from dtos.breast_cancer_dataset import BreastCancerDataset, ExamInformation
+from dtos.breast_cancer_dataset import (
+    ASSESSMENT_DERIVED,
+    ASSESSMENT_GROUNDED,
+    BreastCancerDataset,
+    ExamInformation,
+)
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
-from dtos.json_report_findings import Assessment, BreastFindings, JSONReportFindings
+from dtos.json_report_findings import (
+    SCOPE_COMPLETE,
+    SCOPE_INDEX_ONLY,
+    Assessment,
+    BreastFindings,
+    JSONReportFindings,
+)
+from utils.error_handling import pool_worker
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
     BILATERAL,
+    BIRADS_MAPPING,
+    MRI,
     NOT_PRESENT,
+    PRESENT,
     UNKNOWN,
     bin_age,
-    birads_mapping,
-    breast_density,
     csv_column_cleaning,
     get_proper_birads,
-    get_proper_breast_density,
     get_proper_contrast_phase,
+    get_proper_mri_fgt,
     get_value,
     isna_v2,
+    normalize_to_uint16,
     race_mappings,
     read_nii_gz_images,
-    sanitize_age,
+    read_nii_gz_raw,
     yes_no_mapping,
 )
 
@@ -41,10 +54,11 @@ csv_save_path = "../data/processed/mama-mia/mama-mia.csv"
 
 
 class MamaMia(BreastCancerDataset):
-    _modality = "mr"
+    _modality = MRI
     _birads = "highly suggestive of malignancy"  # all patients have cancer (birads 6), but we set this to the highest non-biopsy proven value (birads 5)
 
-    _SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES = 1
+    _SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES = 4
+    _NEGATIVES_PER_SIDE = 1
 
     def __init__(self):
         super().__init__(csv_save_path=csv_save_path)
@@ -52,7 +66,7 @@ class MamaMia(BreastCancerDataset):
             raw_imgs_path=raw_imgs_path,
             processed_imgs_path=processed_imgs_path,
             image_preprocessing_config=ImagePreprocessingConfig(
-                read_func=partial(read_nii_gz_images)
+                modality=MRI, read_func=partial(read_nii_gz_images)
             ),
         )
 
@@ -113,9 +127,6 @@ class MamaMia(BreastCancerDataset):
         self.clinical_df["has implant"] = self.clinical_df["has implant"].apply(
             lambda x: get_value(x, yes_no_mapping)
         )
-        self.clinical_df["breast density"] = self.clinical_df["breast density"].apply(
-            lambda x: get_value(x, breast_density) if not isna_v2(x) else None
-        )
         self.clinical_df["bilateral mri"] = self.clinical_df["bilateral mri"].apply(
             lambda x: get_value(x, yes_no_mapping)
         )
@@ -128,24 +139,11 @@ class MamaMia(BreastCancerDataset):
             group for _, group in self.clinical_df.groupby("patient id")
         ]
 
-        # Process the exams
-        n = cpu_count() - 1
-        with Pool(processes=n) as p:
-            results = list(
-                tqdm(
-                    p.imap(self.process_patient, grouped_patients),
-                    total=len(grouped_patients),
-                    desc="Processing mama-mia patients",
-                    unit="patient",
-                    ncols=100,
-                    position=0,
-                    leave=True,
-                )
-            )
-        for result in results:
-            for exam in result:
-                self.append_exam(exam)
+        self.run_pool(
+            self.process_patient, grouped_patients, "Processing mama-mia patients"
+        )
 
+    @pool_worker
     def process_patient(self, grpo):
         curr_exams = []
 
@@ -158,6 +156,8 @@ class MamaMia(BreastCancerDataset):
             0
         ]  # NOTE: The dataframe per patient will always only 1 row, so we access it this way
 
+        patient_id = f"{self.get_dataset_name()}-{grpo['patient id']}"
+
         available_imgs = sorted(
             os.listdir(os.path.join(raw_imgs_path, grpo["patient id"]))
         )
@@ -165,11 +165,7 @@ class MamaMia(BreastCancerDataset):
             path for path in available_imgs if path.endswith(raw_imgs_extension)
         ]
 
-        exams_contrast_phase = (
-            self.get_exams_types(eval(grpo["acquisition times"]))
-            if not isna_v2(grpo["acquisition times"])
-            else [None] * len(available_imgs)
-        )
+        exams_contrast_phase = self.get_contrast_phases(grpo, len(available_imgs))
 
         seg_path = os.path.join(
             raw_segs_path, f"{grpo['patient id']}{raw_imgs_extension}"
@@ -184,187 +180,235 @@ class MamaMia(BreastCancerDataset):
             )
         else:
             logging.warning(f"Segmentation {seg_path} was not able to be read")
+            return curr_exams
+
+        # DCE-MRI phases only mean something relative to each other: the lesion is
+        # what brightens between pre- and post-contrast. Normalising each phase
+        # against its own min/max would rescale that difference away, so all the
+        # phases of a patient are normalised against shared statistics.
+        volume_range = self.get_shared_intensity_range(grpo, available_imgs)
+
+        # Slices covered by the expert segmentation.
+        lesion_slices = [
+            idx for idx in range(seg_slices.shape[0]) if np.sum(seg_slices[idx]) > 0
+        ]
+        if not lesion_slices:
+            logging.warning(
+                f"No non-empty segmentation slice for patient {grpo['patient id']}. Skipping."
+            )
+            return curr_exams
+
+        # Keep the central slice only => avoid near-duplicate slices of one lesion.
+        central_lesion_slice = lesion_slices[len(lesion_slices) // 2]
+
+        # Lesion-free negatives are measured from the FULL lesion extent, not from the central slice
+        slices_without_seg = self.get_lesion_free_slices(
+            grpo, lesion_slices, seg_slices.shape[0]
+        )
 
         for i, exam_path in enumerate(available_imgs):
             exam_path = os.path.join(raw_imgs_path, grpo["patient id"], exam_path)
 
-            if isna_v2(seg_slices):
-                logging.warning(
-                    f"Skipping exam {exam_path} for patient {grpo['patient id']} due to missing segmentation."
-                )
-                continue
-
-            exam_slices = self.image_processor.read_image(exam_path)
-            if not isna_v2(exam_slices):
-                processed_slices = np.array(
-                    [
-                        self.image_processor.apply_processing(slice)
-                        for slice in exam_slices
-                    ]
-                )
-            else:
+            exam_slices = read_nii_gz_raw(exam_path)
+            if isna_v2(exam_slices):
                 logging.warning(f"Exam images of {exam_path} were not able to be read")
                 continue
 
-            # compute the indexes of the slices that have segmentation with non-zero values => lesion present
-            slices_with_seg = [
-                idx for idx in range(seg_slices.shape[0]) if np.sum(seg_slices[idx]) > 0
-            ]
+            exam_slices = normalize_to_uint16(exam_slices, value_range=volume_range)
 
-            # just keep the central slice of the slices_with_seg => avoid near-duplicate slices for the same lesion
-            slices_with_seg = (
-                [slices_with_seg[len(slices_with_seg) // 2]]
-                if len(slices_with_seg) > 0
-                else []
+            if exam_slices.shape[0] != seg_slices.shape[0]:
+                logging.warning(
+                    f"Slice count mismatch for patient {grpo['patient id']} on {exam_path}: "
+                    f"{exam_slices.shape[0]} image slices vs {seg_slices.shape[0]} segmentation slices. Skipping."
+                )
+                continue
+
+            processed_slices = np.array(
+                [self.image_processor.apply_processing(slice) for slice in exam_slices]
             )
 
-            # construct a new slices without segmentation for negative samples
-            # we take a number of slices before the lowest slice with segmentation and after the highest slice with segmentation
-            slices_without_seg = []
+            contrast_phase = exams_contrast_phase[i]
 
-            if len(slices_with_seg) > 0:
-                lowest_slice_with_seg = (
-                    min(slices_with_seg)
-                    - self._SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES
-                )  # buffer of slices before the lesion
-                highest_slice_with_seg = (
-                    max(slices_with_seg)
-                    + self._SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES
-                )  # buffer of slices after the lesion
-
-                # slices before the lesion
-                start_idx = max(
-                    0,
-                    lowest_slice_with_seg
-                    - self._SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES,
-                )
-                end_idx = lowest_slice_with_seg
-                slices_without_seg.extend(list(range(start_idx, end_idx)))
-
-                # slices after the lesion
-                start_idx = highest_slice_with_seg + 1
-                end_idx = min(
-                    seg_slices.shape[0],
-                    highest_slice_with_seg
-                    + 1
-                    + self._SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES,
-                )
-                slices_without_seg.extend(list(range(start_idx, end_idx)))
-
-            for k in slices_with_seg:  # we have a non-empty segmentation
-                exam_id = str(uuid.uuid4())
-                contrast_phase = exams_contrast_phase[i]
-                imgs_path = self.image_processor.save_image_set(
-                    imgs=[processed_slices[k]],
-                    exam_id=exam_id + f"_{contrast_phase}_slice_{k}",
-                    patient_id=grpo["patient id"],
-                )
-                segs_path = self.image_processor.save_segmentation_set(
-                    segs=[seg_slices[k]],
-                    exam_id=exam_id + f"_{contrast_phase}_slice_{k}",
-                    patient_id=grpo["patient id"],
-                )
-
-                if isna_v2(imgs_path):
-                    logging.warning(
-                        f"Skipping exam {exam_path} for patient {grpo['patient id']} due to processing issues."
-                    )
-                    continue
-
-                # construct context
-                context = JSONReportContext(
-                    patient_context=PatientContext(
-                        age=bin_age(sanitize_age(grpo["age"])),
-                        has_implants=grpo["has implant"],
-                    ),
-                    exam_context=ExamContext(
-                        modality=self._modality,
-                        laterality=(
-                            BILATERAL if grpo["bilateral mri"] == "yes" else None
-                        ),
-                        contrast_phase=get_proper_contrast_phase(contrast_phase),
-                    ),
-                )
-
-                # construct final exam info
-                findings = JSONReportFindings(
-                    breast=BreastFindings(
-                        density=get_proper_breast_density(grpo["breast density"])
-                    ),
-                    assessment=Assessment(birads=get_proper_birads(self._birads)),
-                )
-
-                exam = ExamInformation(
-                    id=exam_id,
-                    patient=grpo["patient id"],
-                    dataset=grpo["dataset"],
-                    modality=self._modality,
-                    birads=get_proper_birads(self._birads),
-                    race=grpo["ethnicity"],
-                    machine=f"{grpo['manufacturer']} {grpo['scanner model']}",
-                    exam=imgs_path,
-                    segmentation=[segs_path] if not isna_v2(segs_path) else None,
-                    context=context.get_string(),
-                    findings=findings.get_string(),
-                )
+            exam = self.build_exam(
+                grpo=grpo,
+                patient_id=patient_id,
+                img=processed_slices[central_lesion_slice],
+                seg=seg_slices[central_lesion_slice],
+                slice_idx=central_lesion_slice,
+                contrast_phase=contrast_phase,
+                lesion=PRESENT,
+                birads=self._birads,
+            )
+            if exam is not None:
                 curr_exams.append(exam)
 
-            for k in slices_without_seg:  # we have an empty segmentation
-                exam_id = str(uuid.uuid4())
-                contrast_phase = exams_contrast_phase[i]
-                imgs_path = self.image_processor.save_image_set(
-                    imgs=[processed_slices[k]],
-                    exam_id=exam_id + f"_{contrast_phase}_slice_{k}",
-                    patient_id=grpo["patient id"],
-                )
-
-                if isna_v2(imgs_path):
-                    logging.warning(
-                        f"Skipping exam {exam_path} for patient {grpo['patient id']} due to processing issues."
-                    )
-                    continue
-
-                # construct context
-                context = JSONReportContext(
-                    patient_context=PatientContext(
-                        age=bin_age(sanitize_age(grpo["age"])),
-                        has_implants=grpo["has implant"],
-                    ),
-                    exam_context=ExamContext(
-                        modality=self._modality,
-                        laterality=(
-                            BILATERAL if grpo["bilateral mri"] == "yes" else None
-                        ),
-                        contrast_phase=get_proper_contrast_phase(contrast_phase),
-                    ),
-                )
-
-                # construct final exam info
-                findings = JSONReportFindings(
+            for k in slices_without_seg:
+                exam = self.build_exam(
+                    grpo=grpo,
+                    patient_id=patient_id,
+                    img=processed_slices[k],
+                    seg=None,
+                    slice_idx=k,
+                    contrast_phase=contrast_phase,
                     lesion=NOT_PRESENT,
-                    assessment=Assessment(
-                        birads=get_proper_birads(birads_mapping[1])
-                    ),  # negative, since no lesion present is a healthy slice
+                    birads=BIRADS_MAPPING[1],  # no lesion on this slice
                 )
-
-                exam = ExamInformation(
-                    id=exam_id,
-                    patient=grpo["patient id"],
-                    dataset=grpo["dataset"],
-                    modality=self._modality,
-                    birads=get_proper_birads(birads_mapping[1]),
-                    race=grpo["ethnicity"],
-                    machine=f"{grpo['manufacturer']} {grpo['scanner model']}",
-                    exam=imgs_path,
-                    segmentation=None,
-                    context=context.get_string(),
-                    findings=findings.get_string(),
-                )
-                curr_exams.append(exam)
+                if exam is not None:
+                    curr_exams.append(exam)
 
         return curr_exams
 
-    def get_exams_types(self, acquisition_times: list) -> list[str]:
+    def build_exam(
+            self,
+            grpo,
+            patient_id: str,
+            img,
+            seg,
+            slice_idx: int,
+            contrast_phase,
+            lesion,
+            birads: str | None,
+    ):
+        exam_id = str(uuid.uuid4())
+        slice_ref = f"{exam_id}_{contrast_phase}_slice_{slice_idx}"
+
+        imgs_path = self.image_processor.save_image_set(
+            imgs=[img], exam_id=slice_ref, patient_id=patient_id
+        )
+        if isna_v2(imgs_path):
+            logging.warning(
+                f"Skipping slice {slice_idx} for patient {patient_id} due to processing issues."
+            )
+            return None
+
+        segs_path = (
+            self.image_processor.save_segmentation_set(
+                segs=[seg], exam_id=slice_ref, patient_id=patient_id
+            )
+            if seg is not None
+            else None
+        )
+
+        context = JSONReportContext(
+            patient_context=PatientContext(
+                age=bin_age(grpo["age"]),
+                has_implants=grpo["has implant"],
+            ),
+            exam_context=ExamContext(
+                modality=self._modality,
+                laterality=(BILATERAL if grpo["bilateral mri"] == "yes" else None),
+                contrast_phase=get_proper_contrast_phase(contrast_phase),
+            ),
+        )
+
+        assessment_birads = (
+            get_proper_birads(birads, modality=MRI) if birads is not None else None
+        )
+
+        multifocal = (
+                grpo.get("multifocal cancer") == "yes"
+                or grpo.get("bilateral breast cancer") == "yes"
+        )
+
+        findings = JSONReportFindings.build(
+            breast=BreastFindings(fgt=get_proper_mri_fgt(grpo["breast density"])),
+            lesion=lesion,
+            assessment=(
+                Assessment(birads=assessment_birads)
+                if assessment_birads is not None
+                else None
+            ),
+            annotation_scope=SCOPE_INDEX_ONLY if multifocal else SCOPE_COMPLETE,
+        )
+
+        machine = " ".join(
+            str(v)
+            for v in (grpo["manufacturer"], grpo["scanner model"])
+            if not isna_v2(v)
+        )
+
+        return ExamInformation(
+            id=exam_id,
+            patient=patient_id,
+            dataset=f"{self.get_dataset_name()}/{str(grpo['dataset']).strip().lower()}",
+            modality=self._modality,
+            birads=assessment_birads if assessment_birads is not None else UNKNOWN,
+            race=grpo["ethnicity"],
+            machine=machine if machine else UNKNOWN,
+            exam=imgs_path,
+            segmentation=[segs_path] if not isna_v2(segs_path) else None,
+            context=context.get_string(),
+            findings=findings.get_string(),
+            exam_id=patient_id,
+            breast_id=None,  # bilateral acquisition
+            assessment_scope=(
+                ASSESSMENT_GROUNDED if seg is not None else ASSESSMENT_DERIVED
+            ),
+        )
+
+    def get_lesion_free_slices(
+            self, grpo, lesion_slices: list[int], n_slices: int
+    ) -> list[int]:
+        if grpo.get("multifocal cancer") == "yes" or (
+                grpo.get("bilateral breast cancer") == "yes"
+        ):
+            return []
+
+        buffer = self._SLICES_AFTER_AND_BEFORE_LESION_FOR_NEGATIVES
+        first_lesion_slice, last_lesion_slice = min(lesion_slices), max(lesion_slices)
+
+        before_end = first_lesion_slice - buffer
+        before = list(range(max(0, before_end - self._NEGATIVES_PER_SIDE), before_end))
+
+        after_start = last_lesion_slice + buffer + 1
+        after = list(
+            range(after_start, min(n_slices, after_start + self._NEGATIVES_PER_SIDE))
+        )
+
+        lesion_slice_set = set(lesion_slices)
+        return [
+            k for k in before + after if 0 <= k < n_slices and k not in lesion_slice_set
+        ]
+
+    def get_shared_intensity_range(self, grpo, available_imgs: list[str]):
+        """Min/max across every contrast phase of one patient."""
+        mins, maxs = [], []
+        for rel_path in available_imgs:
+            volume = read_nii_gz_raw(
+                os.path.join(raw_imgs_path, grpo["patient id"], rel_path)
+            )
+            if isna_v2(volume):
+                continue
+            mins.append(float(np.nanmin(volume)))
+            maxs.append(float(np.nanmax(volume)))
+
+        if not mins or not maxs:
+            return None
+        return min(mins), max(maxs)
+
+    def get_contrast_phases(self, grpo, n_images: int) -> list:
+        phases: list = []
+        if not isna_v2(grpo["acquisition times"]):
+            try:
+                phases = self.get_exams_types(
+                    ast.literal_eval(str(grpo["acquisition times"]))
+                )
+            except (ValueError, SyntaxError) as e:
+                logging.warning(
+                    f"Could not parse acquisition times for patient {grpo['patient id']}: {e}"
+                )
+
+        if len(phases) != n_images:
+            if phases:
+                logging.warning(
+                    f"Patient {grpo['patient id']}: {len(phases)} acquisition times for "
+                    f"{n_images} volumes. Falling back to positional phase naming."
+                )
+            phases = self.get_exams_types(range(n_images))
+
+        return phases
+
+    def get_exams_types(self, acquisition_times) -> list[str]:
         desc = []
 
         for i, _ in enumerate(acquisition_times):
