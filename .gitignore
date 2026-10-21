@@ -154,6 +154,9 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
+!.env.*.example
 .envrc
 .venv
 env/
@@ -161,6 +164,18 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Credentials and private keys
+.aws/
+.ssh/
+credentials.json
+service-account*.json
+id_rsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Spyder project settings
 .spyderproject
