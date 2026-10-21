@@ -1,7 +1,7 @@
 # BreXpert-MM Reconstruction Manifest
 
 pipeline:
-  git_commit: 46e791e2d27a45f3a2b7525a9a226eb6b58deaf5
+  git_commit: 6047f3d72e5a06bd1cad9f6ca01131fddc344c3e
   robust_vqa: true
   lexicon: ACR BI-RADS v2025 (6th edition)
   canvas_order: [width, height]
