@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def assert_patient_disjoint(
-        train_patients: set, val_patients: set, test_patients: set
+    train_patients: set, val_patients: set, test_patients: set
 ) -> None:
     logger.info("\n=== LEAKAGE CHECK ===")
     logger.info(f"Train ∩ Val:  {len(train_patients & val_patients)}")
@@ -41,10 +41,10 @@ def _has_any_segmentation(df: pd.DataFrame) -> bool:
 
 
 def save_memmap(
-        df: pd.DataFrame,
-        imgs_filename: str,
-        images_shape: tuple,
-        segs_filename: str | None = None,
+    df: pd.DataFrame,
+    imgs_filename: str,
+    images_shape: tuple,
+    segs_filename: str | None = None,
 ) -> pd.DataFrame:
     if len(df) == 0:
         logger.warning("Dataframe is empty, no data to save")
@@ -75,13 +75,13 @@ def save_memmap(
     multiframe = 0
     index = 0
     for row_idx, row in enumerate(
-            tqdm(
-                df.itertuples(),
-                total=n_images,
-                desc="Saving images",
-                unit="image",
-                leave=False,
-            )
+        tqdm(
+            df.itertuples(),
+            total=n_images,
+            desc="Saving images",
+            unit="image",
+            leave=False,
+        )
     ):
         try:
             frames = load_image_frames(row.exam)
@@ -194,12 +194,12 @@ def save_frozen_assignment(path: str, assignments: pd.DataFrame) -> None:
 
 
 def assign_patient_strata(
-        agg_df: pd.DataFrame,
-        label_col: str = "collapsed_birads",
-        modality_col: str = "modality",
-        severity_col: str | None = "birads",
-        dataset_col: str | None = "dataset",
-        min_stratum_patients: int = 3,
+    agg_df: pd.DataFrame,
+    label_col: str = "collapsed_birads",
+    modality_col: str = "modality",
+    severity_col: str | None = "birads",
+    dataset_col: str | None = "dataset",
+    min_stratum_patients: int = 3,
 ) -> pd.DataFrame:
     needed = [c for c in ("patient", modality_col, label_col) if c is not None]
     df = agg_df.loc[:, [c for c in needed if c in agg_df.columns]].copy()
@@ -300,12 +300,12 @@ def _coarsen(keys: list[pd.Series], min_patients: int) -> pd.Series:
 
 
 def _allocate(
-        patients: list[str],
-        weights: dict[str, int],
-        val_frac: float,
-        test_frac: float,
-        budget_by: str,
-        preassigned: dict[str, str] | None = None,
+    patients: list[str],
+    weights: dict[str, int],
+    val_frac: float,
+    test_frac: float,
+    budget_by: str,
+    preassigned: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     preassigned = preassigned or {}
     fracs = {
@@ -324,7 +324,7 @@ def _allocate(
     # between patients of equal size.
     order = {patient: i for i, patient in enumerate(patients)}
     for placed, patient in enumerate(
-            sorted(patients, key=lambda p: (-sizes[p], order[p]))
+        sorted(patients, key=lambda p: (-sizes[p], order[p]))
     ):
         split = preassigned.get(patient)
         if split is None:
@@ -347,14 +347,15 @@ def _allocate(
 
 
 def _enforce_minimum(
-        assigned: dict[str, list[str]],
-        min_per_split: int,
-        weights: dict[str, int],
-        locked: set[str],
+    assigned: dict[str, list[str]],
+    min_per_split: int,
+    weights: dict[str, int],
+    locked: set[str],
+    active_splits: tuple[str, ...],
 ) -> None:
     if min_per_split <= 0:
         return
-    if sum(len(v) for v in assigned.values()) < 3 * min_per_split:
+    if sum(len(v) for v in assigned.values()) < len(active_splits) * min_per_split:
         return
 
     def movable(split: str) -> list[str]:
@@ -365,10 +366,12 @@ def _enforce_minimum(
         )
 
     for split in (TEST, VAL):
+        if split not in active_splits:
+            continue
         while len(assigned[split]) < min_per_split:
             donors = [
                 d
-                for d in SPLITS
+                for d in active_splits
                 if d != split and len(assigned[d]) > min_per_split and movable(d)
             ]
             if not donors:
@@ -382,17 +385,17 @@ def _enforce_minimum(
 
 
 def split_data_stratified(
-        agg_df: pd.DataFrame,
-        val_frac: float = 0.10,
-        test_frac: float = 0.20,
-        seed: int = 42,
-        label_col: str = "collapsed_birads",
-        modality_col: str = "modality",
-        severity_col: str | None = "birads",
-        dataset_col: str | None = "dataset",
-        min_per_split: int = 1,
-        budget_by: str = "rows",
-        frozen: dict[str, str] | None = None,
+    agg_df: pd.DataFrame,
+    val_frac: float = 0.10,
+    test_frac: float = 0.20,
+    seed: int = 42,
+    label_col: str = "collapsed_birads",
+    modality_col: str = "modality",
+    severity_col: str | None = "birads",
+    dataset_col: str | None = "dataset",
+    min_per_split: int = 1,
+    budget_by: str = "rows",
+    frozen: dict[str, str] | None = None,
 ) -> SplitResult:
     if not 0 <= val_frac < 1 or not 0 <= test_frac < 1 or val_frac + test_frac >= 1:
         raise ValueError(
@@ -402,17 +405,36 @@ def split_data_stratified(
     if budget_by not in ("rows", "patients"):
         raise ValueError(f"budget_by must be 'rows' or 'patients', got {budget_by!r}")
 
+    frozen = dict(frozen or {})
+    inbreast = (
+        agg_df.loc[agg_df["dataset"] == "inbreast", "patient"]
+        if "dataset" in agg_df.columns
+        else pd.Series(dtype=str)
+    )
+    if inbreast.eq("inbreast-unresolved").any():
+        if any(
+            str(patient).startswith("inbreast-") and split != TRAIN
+            for patient, split in frozen.items()
+        ):
+            raise ValueError(
+                "INbreast has unresolved IDs and a held-out frozen assignment. "
+                "Rebuild the splits with --reshuffle before using the training-only policy."
+            )
+        frozen.update({patient: TRAIN for patient in inbreast.unique()})
+
+    active_splits = (
+        (TRAIN,) + ((VAL,) if val_frac else ()) + ((TEST,) if test_frac else ())
+    )
     strata = assign_patient_strata(
         agg_df,
         label_col=label_col,
         modality_col=modality_col,
         severity_col=severity_col,
         dataset_col=dataset_col,
-        min_stratum_patients=3 * max(min_per_split, 1),
+        min_stratum_patients=len(active_splits) * max(min_per_split, 1),
     )
     weights = dict(zip(strata["patient"], strata["n_rows"]))
 
-    frozen = frozen or {}
     known = set(strata["patient"])
     reused = sum(1 for patient in frozen if patient in known)
     if frozen:
@@ -427,7 +449,7 @@ def split_data_stratified(
 
     logger.info("=== STRATA (patients / images) ===")
     for stratum, group in sorted(
-            strata.groupby("stratum"), key=lambda item: str(item[0])
+        strata.groupby("stratum"), key=lambda item: str(item[0])
     ):
         patients = sorted(
             group["patient"],
@@ -439,15 +461,21 @@ def split_data_stratified(
         assigned = _allocate(
             patients, weights, val_frac, test_frac, budget_by, preassigned=frozen
         )
-        _enforce_minimum(assigned, min_per_split, weights, locked=set(frozen))
+        _enforce_minimum(
+            assigned,
+            min_per_split,
+            weights,
+            locked=set(frozen),
+            active_splits=active_splits,
+        )
 
         for split, members in assigned.items():
             for patient in members:
                 assignment[patient] = split
                 stratum_of[patient] = stratum
 
-        short = len(patients) >= 3 * max(min_per_split, 1) and not (
-                assigned[VAL] and assigned[TEST]
+        short = len(patients) >= len(active_splits) * max(min_per_split, 1) and any(
+            not assigned[split] for split in active_splits if split != TRAIN
         )
         if short and any(p in frozen for p in patients):
             logger.warning(
@@ -470,6 +498,7 @@ def split_data_stratified(
             "or test: " + "; ".join(coverage_failures)
         )
 
+    assignment = {**frozen, **assignment}
     split_series = agg_df["patient"].map(lambda p: assignment.get(p, TRAIN))
     unstratified = agg_df.loc[~agg_df["patient"].isin(assignment), "patient"]
     if len(unstratified):
@@ -486,7 +515,7 @@ def split_data_stratified(
             {
                 "patient": list(assignment),
                 "split": [assignment[p] for p in assignment],
-                "stratum": [stratum_of[p] for p in assignment],
+                "stratum": [stratum_of.get(p) for p in assignment],
                 "seed": seed,
             }
         ).sort_values("patient", ignore_index=True),
@@ -499,7 +528,7 @@ def split_data_stratified(
 
 
 def _log_distribution(
-        agg_df, split_series, label_col, modality_col, dataset_col=None
+    agg_df, split_series, label_col, modality_col, dataset_col=None
 ) -> None:
     labelled = agg_df.assign(split=split_series)
 

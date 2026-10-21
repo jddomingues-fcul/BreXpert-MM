@@ -1,6 +1,5 @@
 import logging
 import os
-import uuid
 from functools import partial
 from glob import glob
 
@@ -11,6 +10,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext
@@ -50,6 +50,7 @@ csv_save_path: str = "../data/processed/la-breast/la-breast.csv"
 
 
 class LABreast(BreastCancerDataset):
+
     _modality = MRI
     _race = UNKNOWN
     _machine = "Multiple 1.5T scanners"
@@ -73,6 +74,7 @@ class LABreast(BreastCancerDataset):
         )
 
     def process_info(self):
+        self.report.rows_seen = len(self.clinical_df)
         # 1. Adjust the birads values
         self.clinical_df["birads"] = self.clinical_df["birads"].apply(
             lambda x: map_birads(x, source="LA-Breast", modality=MRI)
@@ -163,8 +165,12 @@ class LABreast(BreastCancerDataset):
             return curr_exams
 
         patient = patient_df.iloc[0]["patient"].replace("Breast_", "")
-        patient_imgs = glob(
-            os.path.join(raw_imgs_path, "**", "**", f"{patient}*{raw_imgs_extension}")
+        patient_imgs = sorted(
+            glob(
+                os.path.join(
+                    raw_imgs_path, "**", "**", f"{patient}*{raw_imgs_extension}"
+                )
+            )
         )
 
         allowed_im_types = [c for c in self.SEQUENCE_COLUMNS if c in patient_df.columns]
@@ -183,15 +189,21 @@ class LABreast(BreastCancerDataset):
 
                 for im_path in patient_imgs:
                     if (
-                            curr_type_value.lower() in im_path.lower()
-                            and roi_value in im_path.lower()
+                        curr_type_value.lower() in im_path.lower()
+                        and roi_value in im_path.lower()
                     ):
                         dx = row.get(f"distancia x {im_type}")
                         dy = row.get(f"distancia y {im_type}")
                         cx = row.get(f"centro x {im_type}")
                         cy = row.get(f"centro y {im_type}")
 
-                        exam_id = str(uuid.uuid4())
+                        exam_id = stable_exam_id(
+                            self.get_dataset_name(),
+                            row["patient"],
+                            row["roi"],
+                            im_type,
+                            curr_type_value,
+                        )
                         patient_id = f"{self.get_dataset_name()}-{row['patient']}"
 
                         processed_img, img_shape = self.process_slice(im_path)
@@ -333,7 +345,7 @@ class LABreast(BreastCancerDataset):
         )
 
     def _sample_one_row_per_clinical_group(
-            self, df: pd.DataFrame, random_state: int = 42
+        self, df: pd.DataFrame, random_state: int = 42
     ) -> pd.DataFrame:
         # Keep one random representative row per (patient, birads, breast density)
         if len(df) == 0:

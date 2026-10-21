@@ -1,6 +1,5 @@
 import logging
 import os
-import uuid
 
 import pandas as pd
 
@@ -8,6 +7,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_EXAM_LEVEL,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -65,6 +65,7 @@ class BreastMicroCalc(BreastCancerDataset):
         )
 
     def process_info(self):
+        self.report.rows_seen = len(self.normal_cases) + len(self.suspicious_cases)
         # 1. Adjust normal cases
         self.normal_cases.columns = csv_column_cleaning(list(self.normal_cases.columns))
         self.normal_cases = self.normal_cases.rename(
@@ -101,6 +102,7 @@ class BreastMicroCalc(BreastCancerDataset):
         breast_micro_calc["birads"] = breast_micro_calc["birads"].apply(
             lambda x: map_birads(x, source="Breast-Micro-Calc", modality=MAMMOGRAPHY)
         )
+        breast_micro_calc = breast_micro_calc[breast_micro_calc["birads"].notna()]
         breast_micro_calc["laterality"] = breast_micro_calc["laterality"].apply(
             normalize_laterality
         )
@@ -118,13 +120,17 @@ class BreastMicroCalc(BreastCancerDataset):
 
     @trycatch_func
     def process_row(self, row):
-        cc_recent_id, cc_recent_img = str(uuid.uuid4()), os.path.join(
+        cc_recent_id, cc_recent_img = stable_exam_id(
+            self.get_dataset_name(), row["subfolder"], row["folder #"], "CC_recent"
+        ), os.path.join(
             raw_imgs_path,
             row["subfolder"],
             str(row["folder #"]),
             f"CC_recent{raw_imgs_extension}",
         )
-        mlo_recent_id, mlo_recent_img = str(uuid.uuid4()), os.path.join(
+        mlo_recent_id, mlo_recent_img = stable_exam_id(
+            self.get_dataset_name(), row["subfolder"], row["folder #"], "MLO_recent"
+        ), os.path.join(
             raw_imgs_path,
             row["subfolder"],
             str(row["folder #"]),

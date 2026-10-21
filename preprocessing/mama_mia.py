@@ -1,7 +1,6 @@
 import ast
 import logging
 import os
-import uuid
 from functools import partial
 
 import numpy as np
@@ -12,6 +11,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -74,6 +74,7 @@ class MamaMia(BreastCancerDataset):
         self.clinical_df.columns = csv_column_cleaning(list(self.clinical_df.columns))
 
     def process_info(self):
+        self.report.rows_seen = len(self.clinical_df)
         # Drop un-needed columns
         self.clinical_df = self.clinical_df.drop(
             columns=[
@@ -259,17 +260,19 @@ class MamaMia(BreastCancerDataset):
         return curr_exams
 
     def build_exam(
-            self,
-            grpo,
-            patient_id: str,
-            img,
-            seg,
-            slice_idx: int,
-            contrast_phase,
-            lesion,
-            birads: str | None,
+        self,
+        grpo,
+        patient_id: str,
+        img,
+        seg,
+        slice_idx: int,
+        contrast_phase,
+        lesion,
+        birads: str | None,
     ):
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(
+            self.get_dataset_name(), grpo["patient id"], contrast_phase, slice_idx
+        )
         slice_ref = f"{exam_id}_{contrast_phase}_slice_{slice_idx}"
 
         imgs_path = self.image_processor.save_image_set(
@@ -306,8 +309,8 @@ class MamaMia(BreastCancerDataset):
         )
 
         multifocal = (
-                grpo.get("multifocal cancer") == "yes"
-                or grpo.get("bilateral breast cancer") == "yes"
+            grpo.get("multifocal cancer") == "yes"
+            or grpo.get("bilateral breast cancer") == "yes"
         )
 
         findings = JSONReportFindings.build(
@@ -347,10 +350,10 @@ class MamaMia(BreastCancerDataset):
         )
 
     def get_lesion_free_slices(
-            self, grpo, lesion_slices: list[int], n_slices: int
+        self, grpo, lesion_slices: list[int], n_slices: int
     ) -> list[int]:
         if grpo.get("multifocal cancer") == "yes" or (
-                grpo.get("bilateral breast cancer") == "yes"
+            grpo.get("bilateral breast cancer") == "yes"
         ):
             return []
 

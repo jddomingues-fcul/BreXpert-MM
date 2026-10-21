@@ -3,7 +3,6 @@ import logging
 import os
 import plistlib
 import re
-import uuid
 from collections import Counter
 
 import numpy as np
@@ -14,6 +13,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -78,6 +78,7 @@ class Inbreast(BreastCancerDataset):
         ]  # the last two rows are totals, not needed
 
     def process_info(self):
+        self.report.rows_seen = len(self.clinical_df)
         # Clean the clinical data
         self.clinical_df["file name"] = self.clinical_df["file name"].apply(
             lambda x: str(int(x))
@@ -94,13 +95,14 @@ class Inbreast(BreastCancerDataset):
         )
         self.clinical_df = self.clinical_df[
             self.clinical_df["view"] != "from below"
-            ].reset_index(
+        ].reset_index(
             drop=True
         )  # only one exam with this view, and it's not clear what it means, so dropping it
 
         self.clinical_df["bi-rads"] = self.clinical_df["bi-rads"].apply(
             lambda x: map_birads(x, source="INbreast", modality=MAMMOGRAPHY)
         )
+        self.clinical_df = self.clinical_df[self.clinical_df["bi-rads"].notna()]
         self.clinical_df["mass"] = self.clinical_df["mass"].apply(
             lambda x: get_value(x, yes_no_mapping) if pd.notna(x) else None
         )
@@ -149,7 +151,7 @@ class Inbreast(BreastCancerDataset):
             ~(has_mass & has_micros)
             & (self.clinical_df["distortion"] == "no")
             & (self.clinical_df["asymmetry"] == "no")
-            ].reset_index(drop=True)
+        ].reset_index(drop=True)
 
         # column renameing
         self.clinical_df.rename(
@@ -168,7 +170,7 @@ class Inbreast(BreastCancerDataset):
 
     @trycatch_func
     def process_row(self, row):
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(self.get_dataset_name(), row["file name"])
         patient_id = f"{self.get_dataset_name()}-{row['patient key']}"
 
         exam_imgs_path, img_shape = self.find_and_save_slice(
@@ -244,7 +246,7 @@ class Inbreast(BreastCancerDataset):
     def build_patient_hash_index() -> dict[str, str]:
         index: dict[str, str] = {}
         for path in glob.glob(
-                f"{raw_imgs_path}/**/*{raw_imgs_extension}", recursive=True
+            f"{raw_imgs_path}/**/*{raw_imgs_extension}", recursive=True
         ):
             match = FILENAME_RE.match(os.path.basename(path))
             if match:
@@ -287,21 +289,20 @@ class Inbreast(BreastCancerDataset):
             logging.warning(
                 "INbreast: the 'patient id' column is redacted in this release and the "
                 "DICOM filenames yield no usable patient hash "
-                f"({int(recovered.isna().sum())} of {len(recovered)} rows unmatched), so each "
-                "image is treated as its own patient. Views of the same woman can therefore "
-                "land in different splits -- record this limitation alongside any results."
+                f"({int(recovered.isna().sum())} of {len(recovered)} rows unmatched), so "
+                "unresolved images are grouped together and restricted to training."
             )
-            self.clinical_df["patient key"] = self.clinical_df["file name"]
+            self.clinical_df["patient key"] = "unresolved"
             return
 
         if unusable.any():
             logging.warning(
                 f"INbreast: {int(unusable.sum())} rows have no usable patient id; "
-                "falling back to the file name for those rows only."
+                "grouping those rows as unresolved and restricting them to training."
             )
 
         self.clinical_df["patient key"] = np.where(
-            unusable, self.clinical_df["file name"], self.clinical_df["patient id"]
+            unusable, "unresolved", self.clinical_df["patient id"]
         )
 
     def find_and_save_slice(self, file_name, exam_id, patient_id):

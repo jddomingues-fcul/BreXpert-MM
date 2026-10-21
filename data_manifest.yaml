@@ -12,19 +12,19 @@ pipeline:
   findings_schema: multi-finding (lesions[], lesion_status, annotation_scope)
   assessment_scopes: [grounded, exam_level, derived]
   split:
-    val_frac: 0.10
-    test_frac: 0.20
+    val_frac: 0.05
+    test_frac: 0.05
     seed: 42
     frozen_splits: patient_splits.csv
   vqa:
     max_turns: 16
     train:
-      context_dropout: 0.5
+      context_dropout: 0.2
       shuffle_context: true
       shuffle_questions: true
-      add_negative_examples_prob: 0.5
-      negative_examples_k: 5
-      multiple_choice_prob: 0.25
+      add_negative_examples_prob: 0.0
+      negative_examples_k: 0.0
+      multiple_choice_prob: 0.0
     validation_and_test:
       eval_preset: true
 

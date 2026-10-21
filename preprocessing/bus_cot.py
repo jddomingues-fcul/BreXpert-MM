@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import uuid
 from functools import partial
 
 import pandas as pd
@@ -11,6 +10,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -65,6 +65,7 @@ class BUSCoT(BreastCancerDataset):
         self.df = self.construct_csv_from_json(raw_expert_annotated_json_fp)
 
     def process_info(self):
+        self.report.rows_seen = len(self.df)
         # 1. filter data to only include rows with valid birads
         self.df = self.df[self.df["birads"].notna()]
 
@@ -112,7 +113,7 @@ class BUSCoT(BreastCancerDataset):
 
     @trycatch_func
     def process_row(self, row):
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(self.get_dataset_name(), row.dataset, row.pid)
         source = str(row.dataset).strip().lower().replace(" ", "-")
         patient_id = f"{self.get_dataset_name()}-{source}-{row.patient_id}"
         image_ref = f"{row.pid}-{exam_id}"
@@ -277,11 +278,11 @@ class BUSCoT(BreastCancerDataset):
             mass_echo = []
 
             for pid in tqdm(
-                    json_content,
-                    desc="Processing JSON",
-                    unit="pid",
-                    ncols=100,
-                    total=len(json_content),
+                json_content,
+                desc="Processing JSON",
+                unit="pid",
+                ncols=100,
+                total=len(json_content),
             ):
                 pids.append(pid)
                 datasets.append(json_content[pid]["dataset"])

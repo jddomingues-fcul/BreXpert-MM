@@ -37,6 +37,7 @@ TRAIN_SPLIT_CSV_EXT = "-train.csv"
 VAL_SPLIT_CSV_EXT = "-val.csv"
 TEST_SPLIT_CSV_EXT = "-test.csv"
 
+
 BIRADS_GROUPS = {
     0: "additional evaluation (incomplete)",  # removed upstream; here just in case
     1: "healthy (routine)",
@@ -66,13 +67,15 @@ def load_processed(processed_data_path: str) -> pd.DataFrame:
         os.path.join(processed_data_path, "**/*.parquet"), recursive=True
     )
     parquets = [p for p in parquets if not p.endswith("_build_report.parquet")]
-    if parquets:
-        logging.info(f"Loading {len(parquets)} processed parquet files")
-        return pd.concat([pd.read_parquet(p) for p in parquets], ignore_index=True)
-
     csvs = glob.glob(os.path.join(processed_data_path, "**/*.csv"), recursive=True)
-    logging.info(f"Loading {len(csvs)} processed csv files")
-    return pd.concat([pd.read_csv(c) for c in csvs], ignore_index=True)
+    parquet_stems = {os.path.splitext(p)[0] for p in parquets}
+    csvs = [p for p in csvs if os.path.splitext(p)[0] not in parquet_stems]
+    logging.info(f"Loading {len(parquets)} parquet and {len(csvs)} CSV files")
+    return pd.concat(
+        [pd.read_parquet(p) for p in sorted(parquets)]
+        + [pd.read_csv(p) for p in sorted(csvs)],
+        ignore_index=True,
+    )
 
 
 def prepare_labels(agg_df: pd.DataFrame) -> pd.DataFrame:
@@ -84,18 +87,18 @@ def prepare_labels(agg_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_splits(
-        train_df: pd.DataFrame,
-        test_df: pd.DataFrame,
-        val_df: pd.DataFrame,
-        prefix_name: str,
-        save_path: str,
-        modality: str | None,
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    prefix_name: str,
+    save_path: str,
+    modality: str | None,
 ) -> dict[str, pd.DataFrame]:
     written: dict[str, pd.DataFrame] = {}
     for name, df, bin_ext, csv_ext in (
-            ("train", train_df, TRAIN_SPLIT_BIN_EXT, TRAIN_SPLIT_CSV_EXT),
-            ("test", test_df, TEST_SPLIT_BIN_EXT, TEST_SPLIT_CSV_EXT),
-            ("val", val_df, VAL_SPLIT_BIN_EXT, VAL_SPLIT_CSV_EXT),
+        ("train", train_df, TRAIN_SPLIT_BIN_EXT, TRAIN_SPLIT_CSV_EXT),
+        ("test", test_df, TEST_SPLIT_BIN_EXT, TEST_SPLIT_CSV_EXT),
+        ("val", val_df, VAL_SPLIT_BIN_EXT, VAL_SPLIT_CSV_EXT),
     ):
         if modality is not None:
             bin_path = os.path.join(save_path, f"{prefix_name}{bin_ext}")
@@ -112,20 +115,24 @@ def save_splits(
             df.to_parquet(os.path.splitext(csv_path)[0] + ".parquet", index=False)
         except Exception as exc:
             logging.warning(f"Could not write parquet for {csv_path}: {exc}")
+            parquet_path = os.path.splitext(csv_path)[0] + ".parquet"
+            if os.path.exists(parquet_path):
+                os.remove(parquet_path)
         written[name] = df
 
     return written
 
 
 def combine_modalities(
-        split_df: pd.DataFrame, packed: list[pd.DataFrame]
+    split_df: pd.DataFrame, packed: list[pd.DataFrame]
 ) -> pd.DataFrame:
-    packed = [df for df in packed if len(df)]
     if not packed:
         return split_df.reindex(columns=[*split_df.columns, *MEMMAP_COLUMNS])
 
-    combined = pd.concat(packed, ignore_index=True)
-    leftover = split_df[~split_df["id"].isin(combined["id"])]
+    combined = pd.concat(packed, ignore_index=True).reindex(
+        columns=[*split_df.columns, *MEMMAP_COLUMNS]
+    )
+    leftover = split_df[~split_df["modality"].isin(ALL_MODALITIES)]
     if len(leftover):
         logging.info(
             f"{len(leftover):,} rows are from modalities with no memmap; keeping "
@@ -138,12 +145,12 @@ def combine_modalities(
 
 
 def split_and_save(
-        df: pd.DataFrame,
-        save_path: str,
-        val_frac: float,
-        test_frac: float,
-        seed: int,
-        frozen_path: str | None = None,
+    df: pd.DataFrame,
+    save_path: str,
+    val_frac: float,
+    test_frac: float,
+    seed: int,
+    frozen_path: str | None = None,
 ) -> None:
     logging.info("Splitting report generation data")
     splits = split_data_stratified(
@@ -166,10 +173,6 @@ def split_and_save(
         curr_train = train[train["modality"] == modality].copy(deep=True)
         curr_test = test[test["modality"] == modality].copy(deep=True)
         curr_val = val[val["modality"] == modality].copy(deep=True)
-
-        if len(curr_train) == 0 or len(curr_test) == 0 or len(curr_val) == 0:
-            logging.warning(f"Skipping modality {modality} due to empty splits")
-            continue
 
         written = save_splits(
             curr_train,

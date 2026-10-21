@@ -49,11 +49,16 @@ def pool_worker(func):
     def wrapper(*args, **kwargs):
         from utils.preprocessing import drain_unmapped_counts
 
+        report = args[0].report
+        previous_drops = report.drops.copy()
         try:
             result = func(*args, **kwargs)
         except Exception as e:
             logging.error(f"Error in pool worker {func.__name__}: {e}")
+            report.record_drop("worker failed")
             result = None
-        return result, drain_unmapped_counts()
+        if not result and report.drops == previous_drops:
+            report.record_drop("no usable exam")
+        return result, drain_unmapped_counts(), report.drops - previous_drops
 
     return wrapper

@@ -4,10 +4,10 @@ from collections.abc import Iterator
 
 import numpy as np
 import pandas as pd
-from PIL import Image
 from datasets import Dataset, Features, Sequence, Value
 from datasets import Image as HFImage
 from dotenv import load_dotenv
+from PIL import Image
 
 from dtos.breast_cancer_dataset import parse_segmentation_paths
 from utils.preprocessing import load_image_frames
@@ -162,18 +162,18 @@ def build_rows(shards: list) -> Iterator[dict]:
 
 
 def upload_data_hf(
-        df,
-        repo_id: str,
-        split: str,
-        commit_message: str,
-        token: str | None = None,
-        private: bool = True,
-        num_proc: int = 8,
-        max_shard_size: str = "500MB",
-        dry_run: bool = False,
+    df,
+    repo_id: str,
+    split: str,
+    commit_message: str,
+    token: str | None = None,
+    private: bool = True,
+    num_proc: int = 8,
+    max_shard_size: str = "500MB",
+    dry_run: bool = False,
 ) -> Dataset:
     token = token or os.environ.get("HF_TOKEN")
-    if token is None:
+    if token is None and not dry_run:
         raise RuntimeError("No HF token: set HF_TOKEN or pass token=")
 
     shards = [df.iloc[i::64] for i in range(64)]  # 64 shards, 8 workers
@@ -260,6 +260,7 @@ SPLITS = {
     "val": (VAL_JSONL_PATH, VAL_CSV_PATH),
     "test": (TEST_JSONL_PATH, TEST_CSV_PATH),
 }
+
 
 if __name__ == "__main__":
     args = ArgumentParser()

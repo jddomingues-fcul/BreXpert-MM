@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-import uuid
 from functools import partial
 from glob import glob
 
@@ -12,6 +11,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_EXAM_LEVEL,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -41,6 +41,7 @@ from utils.preprocessing import (
     get_proper_calcification_distribution,
     get_proper_calcification_type,
     get_proper_exam_view,
+    get_proper_finding_type,
     get_proper_location,
     get_proper_mass_density,
     get_value,
@@ -118,7 +119,7 @@ class TompeiCMMD(BreastCancerDataset):
         self.clinical_data.columns = adjusted_cols
 
     def process_info(self):
-
+        self.report.rows_seen = len(self.clinical_data)
         # Exclude rows with exclusion reasons
         self.clinical_data = self.clinical_data[
             self.clinical_data["exclusion reason"].isna()
@@ -137,6 +138,7 @@ class TompeiCMMD(BreastCancerDataset):
         self.clinical_data["birads"] = self.clinical_data["birads"].apply(
             lambda x: map_birads(x, source="TOMPEI-CMMD", modality=MAMMOGRAPHY)
         )
+        self.clinical_data = self.clinical_data[self.clinical_data["birads"].notna()]
         self.clinical_data["mass location"] = self.clinical_data["mass location"].apply(
             lambda x: get_value(x, region_mapping) if not isna_v2(x) else None
         )
@@ -208,7 +210,9 @@ class TompeiCMMD(BreastCancerDataset):
         )
 
         for img_path in imgs:
-            exam_id = str(uuid.uuid4())
+            exam_id = stable_exam_id(
+                self.get_dataset_name(), os.path.relpath(img_path, raw_imgs_path)
+            )
             view = self.get_view(img_path)
             if view is None:
                 logging.warning(
@@ -306,13 +310,18 @@ class TompeiCMMD(BreastCancerDataset):
             ]
         )
         score = (
-                (2 if is_primary else 0)
-                + int(self._has_text(location))
-                + descriptor_count
-                + int(self._has_text(assoc_calc) or self._has_text(assoc_findings))
+            (2 if is_primary else 0)
+            + int(self._has_text(location))
+            + descriptor_count
+            + int(self._has_text(assoc_calc) or self._has_text(assoc_findings))
         )
 
         mapped_shape, mapped_margin = migrate_mammography_microlobulated(shape, margin)
+        finding_type = (
+            get_proper_finding_type(shape, MAMMOGRAPHY)
+            if mapped_shape is None and self._has_text(shape)
+            else None
+        ) or MASS
 
         return {
             "score": score,
@@ -320,20 +329,24 @@ class TompeiCMMD(BreastCancerDataset):
             "descriptor_count": descriptor_count,
             "type_priority": 2,
             "lesion": Lesion(
-                finding_type=MASS,
+                finding_type=finding_type,
                 location=LesionLocation(
                     **get_proper_location(location, row.get("laterality"))
                 ),
-                mass_details=MassAbnormality(
-                    shape=mapped_shape,
-                    margin=mapped_margin,
-                    density=get_proper_mass_density(density),
+                mass_details=(
+                    MassAbnormality(
+                        shape=mapped_shape,
+                        margin=mapped_margin,
+                        density=get_proper_mass_density(density),
+                    )
+                    if finding_type == MASS
+                    else None
                 ),
             ),
         }
 
     def _build_calcification_candidate(
-            self, row, prefix: str, is_primary: bool, associated_col: str | None = None
+        self, row, prefix: str, is_primary: bool, associated_col: str | None = None
     ):
         location_col = f"{prefix}location"
         morphology_col = f"{prefix}morphology"
@@ -364,10 +377,10 @@ class TompeiCMMD(BreastCancerDataset):
             ]
         )
         score = (
-                (2 if is_primary else 0)
-                + int(self._has_text(location))
-                + descriptor_count
-                + int(self._has_text(associated))
+            (2 if is_primary else 0)
+            + int(self._has_text(location))
+            + descriptor_count
+            + int(self._has_text(associated))
         )
 
         calc_type, calc_det = get_proper_calcification_type(morphology)

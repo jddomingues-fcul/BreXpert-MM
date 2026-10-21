@@ -1,73 +1,78 @@
+DATASETS = advanced-mri-lesions breast-lesions-usg breast-micro-calc cbis-ddsm tompei-cmmd oasbud la-breast inbreast mama-mia embed bus-cot
 PYTHON_INTERPRETER = python3
+
+.PHONY: clean clean_logs smoke embed processed-datasets data2hf $(DATASETS)
+
+
+#################################################################################
+# SET HF CACHE																	#
+#################################################################################
+export HF_DATASETS_CACHE ?= /mnt/sam1/hf_datasets_cache
+export HF_HUB_CACHE      ?= /mnt/sam1/hf_hub_cache
+
 
 #################################################################################
 # PROCESSED DATASETS                                                            #
 #################################################################################
-advanced-mri-lesions:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset advanced-mri-lesions
+$(DATASETS):
+	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset $@
 
-breast-lesion-usg:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset breast-lesions-usg
-
-breast-micro-calc:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset breast-micro-calc
-
-cbis-ddsm:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset cbis-ddsm
-
-tompei-cmmd:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset tompei-cmmd
-
-oasbud:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset oasbud
-
-bus-bra:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset bus-bra
-
-la-breast:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset la-breast
-
-inbreast:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset inbreast
-
-mama-mia:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset mama-mia
-
-rsna-bcd:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset rsna-bcd
-
-embed:
-	$(PYTHON_INTERPRETER) -m scripts.preprocess --dataset embed
-
-processed-datasets: advanced-mri-lesions breast-lesion-usg breast-micro-calc cbis-ddsm tompei-cmmd oasbud bus-bra la-breast inbreast mama-mia rsna-bcd embed
+processed-datasets: $(DATASETS)
 	@echo "All datasets processed"
 
 #################################################################################
 # SPLITS                                                                        #
 #################################################################################
 report_generation_dataset:
-	$(PYTHON_INTERPRETER) -m scripts.split --processed_data_path ../data/processed --save_path ../data/report_generation_split
+	$(PYTHON_INTERPRETER) -m scripts.split --processed_data_path ../data/processed --save_path ../data/report_generation_split --val_frac 0.05 --test_frac 0.05
+	@echo "Completed"
+
+# Train gets the augmentation (context withheld at random, shuffling within a
+# stage, inapplicable-question negatives, some questions rendered as multiple
+# choice). Val and test use --eval_preset: full context, fixed order, no
+# negatives, so the evaluation sets are deterministic and every question is
+# answerable from what the model was given.
+#
+# --max_turns 16 keeps the text budget per sample bounded, which matters when
+# LoRA-tuning on a single 24 GB card: ~280 image tokens for a mammogram plus
+# ~16 turns of dialogue stays near 1.2k tokens per sample.
+VQA_TRAIN_FLAGS ?= --shuffle_context --shuffle_questions --context_dropout 0.2 --max_turns 16
+VQA_EVAL_FLAGS ?= --eval_preset --max_turns 16
+
+SPLIT_DIR ?= ../data/report_generation_split
+VQA_DIR   ?= ../data/robust_vqa_split
 
 create_vqa_datasets_robust:
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/all-rg-train.csv --output_dir ../data/robust_vqa_split --split train --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_train.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/all-rg-test.csv --output_dir ../data/robust_vqa_split --split test --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_test.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/all-rg-val.csv --output_dir ../data/robust_vqa_split --split val --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_val.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/all-rg-train.csv --output_dir $(VQA_DIR) --split train $(VQA_TRAIN_FLAGS) --output_fn vqa_train.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/all-rg-test.csv --output_dir $(VQA_DIR) --split test $(VQA_EVAL_FLAGS) --output_fn vqa_test.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/all-rg-val.csv --output_dir $(VQA_DIR) --split val $(VQA_EVAL_FLAGS) --output_fn vqa_val.jsonl
 
+# Split filenames use the short modality codes written by scripts/split.py
+# (mg / us / mr), which is what these targets read.
 create_vqa_datasets_robust_single_modalities:
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/us-rg-train.csv --output_dir ../data/robust_vqa_split --split train --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_train_us.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/us-rg-test.csv --output_dir ../data/robust_vqa_split --split test --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_test_us.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/us-rg-val.csv --output_dir ../data/robust_vqa_split --split val --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_val_us.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/us-rg-train.csv --output_dir $(VQA_DIR) --split train $(VQA_TRAIN_FLAGS) --output_fn vqa_train_us.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/us-rg-test.csv --output_dir $(VQA_DIR) --split test $(VQA_EVAL_FLAGS) --output_fn vqa_test_us.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/us-rg-val.csv --output_dir $(VQA_DIR) --split val $(VQA_EVAL_FLAGS) --output_fn vqa_val_us.jsonl
 
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/mg-rg-train.csv --output_dir ../data/robust_vqa_split --split train --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_train_mg.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/mg-rg-test.csv --output_dir ../data/robust_vqa_split --split test --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_test_mg.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/mg-rg-val.csv --output_dir ../data/robust_vqa_split --split val --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_val_mg.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/mg-rg-train.csv --output_dir $(VQA_DIR) --split train $(VQA_TRAIN_FLAGS) --output_fn vqa_train_mg.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/mg-rg-test.csv --output_dir $(VQA_DIR) --split test $(VQA_EVAL_FLAGS) --output_fn vqa_test_mg.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/mg-rg-val.csv --output_dir $(VQA_DIR) --split val $(VQA_EVAL_FLAGS) --output_fn vqa_val_mg.jsonl
 
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/mr-rg-train.csv --output_dir ../data/robust_vqa_split --split train --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_train_mr.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/mr-rg-test.csv --output_dir ../data/robust_vqa_split --split test --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_test_mr.jsonl
-	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv ../data/report_generation_split/mr-rg-val.csv --output_dir ../data/robust_vqa_split --split val --shuffle_context --shuffle_questions --add_negative_examples_prob 0.5 --negative_examples_k 5 --output_fn vqa_val_mr.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/mr-rg-train.csv --output_dir $(VQA_DIR) --split train $(VQA_TRAIN_FLAGS) --output_fn vqa_train_mr.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/mr-rg-test.csv --output_dir $(VQA_DIR) --split test $(VQA_EVAL_FLAGS) --output_fn vqa_test_mr.jsonl
+	$(PYTHON_INTERPRETER) -m scripts.create_vqa --input_csv $(SPLIT_DIR)/mr-rg-val.csv --output_dir $(VQA_DIR) --split val $(VQA_EVAL_FLAGS) --output_fn vqa_val_mr.jsonl
+
 
 #################################################################################
-# CLEANING
+# DATA 2 HF HUB																	#
+#################################################################################
+data2hf:
+	$(PYTHON_INTERPRETER) -m scripts.data2hf --split val
+	$(PYTHON_INTERPRETER) -m scripts.data2hf --split test
+	$(PYTHON_INTERPRETER) -m scripts.data2hf --split train
+
+#################################################################################
+# CLEANING																		#
 #################################################################################
 clean:
 	find . -type f -name "*.py[co]" -delete

@@ -20,10 +20,10 @@ class ImageProcessor:
     SEGMENTATION_SUFFIX = "_segmentation"
 
     def __init__(
-            self,
-            raw_imgs_path: str,
-            processed_imgs_path: str,
-            image_preprocessing_config: ImagePreprocessingConfig,
+        self,
+        raw_imgs_path: str,
+        processed_imgs_path: str,
+        image_preprocessing_config: ImagePreprocessingConfig,
     ):
         self.raw_imgs_path = raw_imgs_path
         self.processed_imgs_path = processed_imgs_path
@@ -114,7 +114,7 @@ class ImageProcessor:
     @trycatch_func
     @log_func_info
     def save_segmentation_mask(
-            self, segmentation_path: str | None, exam_id: str, patient_id: str
+        self, segmentation_path: str | None, exam_id: str, patient_id: str
     ):
         seg = self.process_segmentation_mask(segmentation_path)
         if seg is None:

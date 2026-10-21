@@ -1,6 +1,5 @@
 import logging
 import os
-import uuid
 from functools import partial
 
 import pandas as pd
@@ -9,6 +8,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -70,6 +70,7 @@ class BreastLesionUSG(BreastCancerDataset):
         )
 
     def process_info(self):
+        self.report.rows_seen = len(self.lesions_usg_df)
         # 1. Drop columns that are not needed, or that we cannot use because are post biopsy
         self.lesions_usg_df = self.lesions_usg_df.drop(
             columns=["mask other filename", "pixel size", "verification"]
@@ -82,6 +83,7 @@ class BreastLesionUSG(BreastCancerDataset):
                 map_birads(x, source="Breast-Lesions-USG", modality=ULTRASOUND)
             )
         )
+        self.lesions_usg_df = self.lesions_usg_df[self.lesions_usg_df["birads"].notna()]
 
         # 3. replace not applicable with None, and not available with None
         self.lesions_usg_df = self.lesions_usg_df.replace("not applicable", None)
@@ -92,7 +94,9 @@ class BreastLesionUSG(BreastCancerDataset):
     @trycatch_func
     def process_row(self, row):
         # get needed info for exam
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(
+            self.get_dataset_name(), row["case id"], row["image filename"]
+        )
         patient_id = f"{self.get_dataset_name()}-{row['case id']}"
 
         exam_imgs_path = self.image_processor.process_and_save_image(

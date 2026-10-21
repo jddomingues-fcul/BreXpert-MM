@@ -1,7 +1,6 @@
 import ast
 import logging
 import os
-import uuid
 from functools import partial
 from typing import cast
 
@@ -12,6 +11,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -106,7 +106,7 @@ class Embed(BreastCancerDataset):
         # drop the rows whose asses is "0", i.e. "A", or where no assessment was made, i.e. "X"
         self.clinical_df = self.clinical_df[
             (self.clinical_df["asses"] != "A") & (self.clinical_df["asses"] != "X")
-            ]
+        ]
 
         # converting birads 6 to birads 5
         self.clinical_df["asses"] = self.clinical_df["asses"].replace("K", "M")
@@ -163,7 +163,7 @@ class Embed(BreastCancerDataset):
         # remove no assessed recommendations, and recommendations that say biopsy already performed
         self.clinical_df = self.clinical_df[
             (self.clinical_df["recc"] != "Z") & (self.clinical_df["recc"] != "&")
-            ]
+        ]
         self.clinical_df["recc"] = self.clinical_df["recc"].apply(
             lambda x: self.clean_recc(x) if not isna_v2(x) else x
         )
@@ -192,7 +192,7 @@ class Embed(BreastCancerDataset):
         )
 
         # The 'side' column in the clinical data represents the laterality of the finding in that row, and can be
-        # L (left), R (right), B (bilateral), or NaN (when there is no finding). Therefore, when merging clinical
+        # L (left), R (right), B (bilateral), or NaN (when there is no finding). Therefore when merging clinical
         # and metadata, we must first match by exam ID and then match the laterality of the clinical finding (side)
         # to the laterality of the image (ImageLateralityFinal)/ Side "B" and "NaN" can be matched to
         # ImageLateralityFinal both "L" and "R"
@@ -200,7 +200,7 @@ class Embed(BreastCancerDataset):
             (df_merged.side == df_merged.ImageLateralityFinal)
             | (df_merged.side == "B")
             | (pd.isna(df_merged.side))
-            ]
+        ]
 
         # 9. Get the column renaming so we can have better descriptions when creating the report
         # construct the legend dictionary to replace the values
@@ -333,14 +333,10 @@ class Embed(BreastCancerDataset):
                 lambda v: tuple(self.parse_roi_boxes(v)) or None
             )
 
-        # 18.2 Drop findings we cannot localise at all. Done BEFORE the primary
-        # finding is chosen: doing it afterward discarded whole images whose
-        # top-ranked row happened to be the unlocalisable one, even when the same
-        # image had other perfectly usable findings.
-        # `keep_primary_rois` above normalises "no ROI" to None, so isna() is a
-        # valid emptiness test here -- the raw column stores the literal "()".
-        out_df = out_df[~(out_df["side"].isna() & out_df["roi_coords"].isna())]
+        self.report.rows_seen = len(out_df)
 
+        # Drop unlocalisable positive findings after normalising assessments;
+        # negative examinations need neither a finding side nor an ROI.
         # 19. Keep all findings and select one primary finding per image later.
         # Normalise to the v2025 vocabulary once, here, so the rank below and the
         # BIRADS_MAPPING[1] comparison later both read the same values.
@@ -351,6 +347,10 @@ class Embed(BreastCancerDataset):
         if unmapped:
             logging.warning(f"EMBED: dropping {unmapped} rows with unmappable BI-RADS.")
         out_df = out_df[out_df["assessment_bi_rads"].notna()].reset_index(drop=True)
+        out_df = out_df[
+            (out_df["assessment_bi_rads"] == BIRADS_MAPPING[1])
+            | ~(out_df["side"].isna() & out_df["roi_coords"].isna())
+        ]
 
         out_df["_birads_rank"] = (
             out_df["assessment_bi_rads"]
@@ -394,7 +394,7 @@ class Embed(BreastCancerDataset):
             by=["empi_anon", "acc_anon", "image_id"], sort=False
         )
 
-        self.report.rows_seen = len(out_df)
+        self.report.filtered_rows = self.report.rows_seen - len(out_df)
         findings_per_image = grouped_patients.size()
         logging.info(
             f"EMBED: {len(out_df)} finding rows across {grouped_patients.ngroups} "
@@ -403,12 +403,15 @@ class Embed(BreastCancerDataset):
         )
 
         for _, g in tqdm(
-                grouped_patients,
-                total=grouped_patients.ngroups,
-                desc="Processing",
-                ncols=100,
+            grouped_patients,
+            total=grouped_patients.ngroups,
+            desc="Processing",
+            ncols=100,
         ):
-            self.append_exams(self.process_patient_exam_img(g))
+            exams = self.process_patient_exam_img(g)
+            if not exams:
+                self.report.record_drop("image processing failed")
+            self.append_exams(exams)
 
     @trycatch_func
     def process_patient_exam_img(self, patient_exam_img_df):
@@ -418,7 +421,9 @@ class Embed(BreastCancerDataset):
             return exams
 
         row = patient_exam_img_df.iloc[0]
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(
+            self.get_dataset_name(), row.empi_anon, row.acc_anon, row.image_id
+        )
         race = get_value_default(row["ethnicity_desc"], race_mappings)
 
         # get the image and the segmentation
@@ -707,14 +712,14 @@ class Embed(BreastCancerDataset):
 
     @trycatch_func
     def save_segmentation_from_rois(
-            self,
-            exam_id,
-            patient_id,
-            original_height: int,
-            original_width: int,
-            resized_height: int,
-            resized_width: int,
-            roi_coords,
+        self,
+        exam_id,
+        patient_id,
+        original_height: int,
+        original_width: int,
+        resized_height: int,
+        resized_width: int,
+        roi_coords,
     ):
 
         normalized_rois = tuple(self.parse_roi_boxes(roi_coords))
@@ -749,7 +754,7 @@ class Embed(BreastCancerDataset):
     @trycatch_func
     def apply_legend_dict(val, header, legend_dict):
         assert (
-                header in legend_dict.keys()
+            header in legend_dict.keys()
         ), f"Header {header} not found in the legend dictionary"
 
         if isna_v2(val):

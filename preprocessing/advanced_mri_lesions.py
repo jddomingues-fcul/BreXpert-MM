@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import random
-import uuid
 from collections import defaultdict
 from copy import deepcopy
 
@@ -16,6 +15,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext, PatientContext
@@ -78,6 +78,7 @@ class AdvancedMRILesions(BreastCancerDataset):
         self.metadata_df = column_cleaning_csv_reading(metadata_path).reset_index()
 
     def process_info(self):
+        self.report.rows_seen = len(self.mri_lesions_df)
         # 1. Drop irrelevant columns
         self.mri_lesions_df = self.mri_lesions_df.drop(
             columns=[
@@ -222,7 +223,7 @@ class AdvancedMRILesions(BreastCancerDataset):
         # 14. drop any additional information birads
         self.mri_lesions_df = self.mri_lesions_df[
             self.mri_lesions_df["birads"] != BIRADS_MAPPING[0]
-            ].reset_index(drop=True)
+        ].reset_index(drop=True)
 
         # 15. swap known biopsy proven to highly suggestive of malignancy
         self.mri_lesions_df["birads"] = self.mri_lesions_df["birads"].apply(
@@ -267,7 +268,7 @@ class AdvancedMRILesions(BreastCancerDataset):
         lesion_ranks = {}
         for i in range(1, 7):
             slice_coord = row[f"slice coord lesion{i}"]
-            if isna_v2(slice_coord) or row[f"type lesion{i}"] is None:
+            if isna_v2(slice_coord):
                 continue
 
             matched = self.find_matching_location(ordered_locations, slice_coord)
@@ -285,13 +286,17 @@ class AdvancedMRILesions(BreastCancerDataset):
             self._positive_exams(row, pat, instances, lesion_ranks, seg_data)
         )
         resulting_exams.extend(
-            self._negative_exams(row, pat, instances, ordered_locations, lesion_ranks)
+            self._negative_exams(
+                row, pat, instances, ordered_locations, lesion_ranks, seg_data
+            )
         )
         return resulting_exams
 
     def _positive_exams(self, row, pat, instances, lesion_ranks, seg_data):
         lesions_by_location: dict[float, list[tuple[int, object]]] = defaultdict(list)
         for i, (_, matched_location, slice_coord) in lesion_ranks.items():
+            if row[f"type lesion{i}"] is None:
+                continue
             lesions_by_location[matched_location].append((i, slice_coord))
 
         exams = []
@@ -338,10 +343,15 @@ class AdvancedMRILesions(BreastCancerDataset):
                 segs.append(seg)
         return segs
 
-    def _negative_exams(self, row, pat, instances, ordered_locations, lesion_ranks):
+    def _negative_exams(
+        self, row, pat, instances, ordered_locations, lesion_ranks, seg_data
+    ):
         exams = []
+        excluded = self.negative_exclusion_ranks(
+            ordered_locations, lesion_ranks, seg_data
+        )
         for negative_location in self.pick_negative_locations(
-                ordered_locations, {rank for rank, _, _ in lesion_ranks.values()}, pat
+            ordered_locations, excluded, pat
         ):
             for inst in instances:
                 if inst["location"] != negative_location:
@@ -361,7 +371,9 @@ class AdvancedMRILesions(BreastCancerDataset):
         return exams
 
     def build_exam(self, row, pat, instance, lesion, birads, segs, assessment_scope):
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(
+            self.get_dataset_name(), os.path.relpath(instance["path"], raw_imgs_path)
+        )
 
         curr_img = self.image_processor.process_image(instance["path"])
         if curr_img is None:
@@ -442,7 +454,7 @@ class AdvancedMRILesions(BreastCancerDataset):
         return ("sagittal", "coronal", "axial")[int(np.argmax(np.abs(normal)))]
 
     def collect_series_instances(
-            self, folder: str, series_description: str = ""
+        self, folder: str, series_description: str = ""
     ) -> list[dict]:
         entries = []
         for path in sorted(glob.glob(os.path.join(folder, "*"))):
@@ -504,7 +516,7 @@ class AdvancedMRILesions(BreastCancerDataset):
                 entry["contrast_phase"] = fixed
             return
 
-        # Within one slice position, a multiphase series differs only by phase.
+        # Within one slice position, a multi-phase series differs only by phase.
         by_location: dict[float, list[dict]] = {}
         for entry in entries:
             by_location.setdefault(entry["location"], []).append(entry)
@@ -534,6 +546,38 @@ class AdvancedMRILesions(BreastCancerDataset):
             if math.isclose(location, target, abs_tol=tol):
                 return location
         return None
+
+    def negative_exclusion_ranks(self, ordered_locations, lesion_ranks, seg_data):
+        if seg_data is None:
+            return set()
+        occupied = set()
+        for group, mask in zip(
+            seg_data["PerFrameFunctionalGroupsSequence"].value, seg_data.pixel_array
+        ):
+            if not np.any(mask):
+                continue
+            position = (
+                group["PlanePositionSequence"]
+                .value[0]["ImagePositionPatient"]
+                .value[-1]
+            )
+            occupied.add(float(position))
+        if not occupied:
+            return set()
+        if any(
+            not any(
+                math.isclose(location, position, abs_tol=1e-2) for position in occupied
+            )
+            for _, location, _ in lesion_ranks.values()
+        ):
+            return set()
+        ranks = {rank for rank, _, _ in lesion_ranks.values()}
+        ranks.update(
+            rank
+            for rank, location in enumerate(ordered_locations)
+            if min(occupied) - 1e-2 <= location <= max(occupied) + 1e-2
+        )
+        return ranks
 
     def pick_negative_locations(self, ordered_locations, lesion_ranks, seed_key):
         if not lesion_ranks:

@@ -59,6 +59,7 @@ STAGE_LOCATION = 5
 STAGE_DESCRIPTOR = 6
 STAGE_ASSESSMENT = 7
 
+
 BIRADS_ANSWER_SPACE = (
     "(1) negative",
     "(2) benign",
@@ -560,6 +561,7 @@ FIELD_SPECS: list[FieldSpec] = [
 
 FIELD_SPECS_BY_ID: dict[str, FieldSpec] = {spec.field_id: spec for spec in FIELD_SPECS}
 
+
 # ===========================================================================
 # APPLICABILITY RULES
 # ===========================================================================
@@ -581,12 +583,20 @@ LESION_TYPE_RULES: dict[str, set[str]] = {
     "lesion.mass details.margin": {MASS},
     "lesion.mass details.density": {MASS},
     "lesion.mass details.echo pattern": {MASS},
-    "lesion.mass details.posterior features": {MASS},
+    "lesion.mass details.posterior features": {MASS, NON_MASS_LESION},
     "lesion.mass details.echogenic feature": {MASS},
     "lesion.calcification details.type": {CALCIFICATION},
     "lesion.calcification details.type details": {CALCIFICATION},
     "lesion.calcification details.distribution": {CALCIFICATION},
 }
+
+# field_specs.py, after LESION_TYPE_RULES
+ANY_FINDING_FIELDS: frozenset[str] = frozenset(
+    field_id
+    for field_id, spec in FIELD_SPECS_BY_ID.items()
+    if field_id not in LESION_TYPE_RULES
+    and "no_lesion" in (spec.negative_response_templates or {})
+)
 
 
 def validate_specs() -> None:
@@ -629,10 +639,11 @@ class NegativeCandidate:
 
 
 def get_negative_candidates(
-        field_specs_by_id: dict[str, FieldSpec],
-        modality: str,
-        lesion_status: str,
-        lesion_types: tuple[str, ...] = (),
+    field_specs_by_id: dict[str, FieldSpec],
+    modality: str,
+    lesion_status: str,
+    lesion_types: tuple[str | None, ...] = (),
+    annotation_scope: str = "unknown",
 ) -> list[NegativeCandidate]:
     candidates: list[NegativeCandidate] = []
     present_types = set(lesion_types)
@@ -646,20 +657,26 @@ def get_negative_candidates(
 
         allowed_modalities = MODALITY_RULES.get(field_id)
         if (
-                allowed_modalities is not None
-                and modality not in allowed_modalities
-                and "wrong_modality" in neg_templates
+            allowed_modalities is not None
+            and modality not in allowed_modalities
+            and "wrong_modality" in neg_templates
         ):
             reasons.append("wrong_modality")
 
         allowed_lesion_types = LESION_TYPE_RULES.get(field_id)
-        if allowed_lesion_types is not None:
-            if lesion_status == "unknown":
-                continue
-            if lesion_status == "absent":
-                if "no_lesion" in neg_templates:
-                    reasons.append("no_lesion")
-            elif not (present_types & allowed_lesion_types):
+        if lesion_status == "absent":
+            if (
+                allowed_lesion_types is not None or field_id in ANY_FINDING_FIELDS
+            ) and "no_lesion" in neg_templates:
+                reasons.append("no_lesion")
+        elif (
+            lesion_status == "present"
+            and annotation_scope == "complete"
+            and lesion_types
+            and all(lesion_types)
+            and allowed_lesion_types is not None
+        ):
+            if not (present_types & allowed_lesion_types):
                 if "wrong_lesion_type" in neg_templates:
                     reasons.append("wrong_lesion_type")
                 elif "no_lesion" in neg_templates:
@@ -676,9 +693,9 @@ def get_negative_candidates(
 
 
 def sample_negative_candidates_one_per_field(
-        rng,
-        candidates: list[NegativeCandidate],
-        k: int,
+    rng,
+    candidates: list[NegativeCandidate],
+    k: int,
 ) -> list[NegativeCandidate]:
     by_field: dict[str, list[NegativeCandidate]] = defaultdict(list)
     for candidate in candidates:

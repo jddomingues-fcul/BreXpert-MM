@@ -39,9 +39,13 @@ Each source must be obtained directly from its original provider — see the lic
 
 `mama-mia` aggregates the DUKE, ISPY1, ISPY2, and NACT components under mixed licenses; keep their provenance separate rather than treating them as one combined permission.
 
+If any INbreast patient IDs cannot be recovered, the entire INbreast source is restricted to training: unidentified views could belong to identified patients. A conflicting frozen assignment stops the split build. Use `--reshuffle` only when deliberately replacing the previous evaluation cohort.
+
 ### 3. Run preprocessing
 
 Each source is processed independently under `../data/processed/`. The adapter writes CSV and Parquet metadata, `uint16` NumPy image arrays, available masks, and a build report with dropped and unmapped values:
+
+BI-RADS 0 is excluded centrally. Build reports distinguish filtered input rows from failed processing units, since one input row can produce multiple images. Exam IDs are derived from source identities; rebuilding the same source preserves those IDs.
 
 ```bash
 mkdir -p logs
@@ -61,6 +65,8 @@ make report_generation_dataset
 ```
 
 This loads the processed Parquet files, falling back to CSV, and collapses BI-RADS into three action-oriented groups: `healthy (routine)`, `probably benign (follow up)`, and `suspicious/malignancy-likely (biopsy)`. It creates patient-disjoint train/val/test splits and saves the patient assignments in `patient_splits.csv` so later rebuilds keep existing patients in the same split. Output lands in `../data/report_generation_split/`, both combined (`all-rg-*`) and per modality (`mg-rg-*`, `mr-rg-*`, `us-rg-*`).
+
+CSV fallback is applied separately to each source. Frozen assignments also retain patients absent from a rebuild. After upgrading from random exam IDs, rebuild preprocessing, splits, and VQA together; keep `patient_splits.csv` unless deliberately replacing the evaluation cohort. Older INbreast splits may require the explicit reshuffle described above.
 
 ### 5. Generate VQA dialogues
 
@@ -111,6 +117,8 @@ Where things end up:
 ## Validating a build
 
 Use `notebooks/preprocessing_audit.ipynb` to check the image pipeline, masks, label mapping, and report JSON against the raw sources. Then run `notebooks/aggregated_data_checks.ipynb` for schema and split checks, and `notebooks/vqa_data_checks.ipynb` for the generated dialogues.
+
+Run the synthetic regression checks with `python -m unittest discover -s tests -v`. They do not require raw datasets or modify remote repositories. The audit notebook reports raw-data checks as unavailable when sources are absent. `hf_data2hub.ipynb` builds local previews using the shared exporter; intentional uploads use `scripts.data2hf`. The BUS-BRA and RSNA walkthroughs are archived as non-executable notes because their adapters are no longer part of this pipeline.
 
 ## Licensing and source terms
 

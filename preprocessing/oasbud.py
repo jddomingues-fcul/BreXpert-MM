@@ -1,5 +1,4 @@
 import logging
-import uuid
 from dataclasses import dataclass
 from functools import partial
 
@@ -10,6 +9,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext
@@ -41,6 +41,7 @@ csv_save_path = "../data/processed/oasbud/oasbud.csv"
 @dataclass(frozen=True)
 class USDataHolder:
     patient_id: str
+    view: int
     img: np.ndarray
     segmentation: np.ndarray
     birads: str
@@ -66,15 +67,17 @@ class Oasbud(BreastCancerDataset):
     def process_info(self):
         acc_data: list[USDataHolder] = []
         assert self.source_data is not None, "No data found in the dataset"
+        self.report.rows_seen = len(self.source_data)
 
         for i, exam_set in tqdm(
-                enumerate(self.source_data), desc="Processing examples oasbud"
+            enumerate(self.source_data), desc="Processing examples oasbud"
         ):
             record_id, us1, us2, seg1, seg2, birads, _ = exam_set
             birads = birads[0]
             us1, us2 = process_us_from_mat(us1), process_us_from_mat(us2)
             birads = map_birads(birads, source="OASBUD", modality=ULTRASOUND)
             if birads is None:
+                self.report.filtered_rows += 1
                 continue
 
             patient_id = self.extract_patient_id(record_id, i)
@@ -82,6 +85,7 @@ class Oasbud(BreastCancerDataset):
             acc_data.append(
                 USDataHolder(
                     patient_id=patient_id,
+                    view=1,
                     img=us1,
                     segmentation=seg1,
                     birads=birads,
@@ -90,6 +94,7 @@ class Oasbud(BreastCancerDataset):
             acc_data.append(
                 USDataHolder(
                     patient_id=patient_id,
+                    view=2,
                     img=us2,
                     segmentation=seg2,
                     birads=birads,
@@ -112,7 +117,9 @@ class Oasbud(BreastCancerDataset):
     @pool_worker
     def process_example(self, example: USDataHolder):
         # get needed info for exam
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(
+            self.get_dataset_name(), example.patient_id, example.view
+        )
         patient_id = f"{self.get_dataset_name()}-{example.patient_id}"
 
         exam, seg = self.image_processor.apply_processing(

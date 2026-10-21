@@ -1,7 +1,6 @@
 import glob
 import logging
 import os
-import uuid
 from functools import partial
 from multiprocessing import Pool, cpu_count
 
@@ -13,6 +12,7 @@ from dtos.breast_cancer_dataset import (
     ASSESSMENT_GROUNDED,
     BreastCancerDataset,
     ExamInformation,
+    stable_exam_id,
 )
 from dtos.dataset_preprocessing_config import ImagePreprocessingConfig
 from dtos.json_report_context import ExamContext, JSONReportContext
@@ -29,7 +29,6 @@ from dtos.json_report_findings import (
 from utils.error_handling import log_func_info, pool_worker, trycatch_func
 from utils.image_processor import ImageProcessor
 from utils.preprocessing import (
-    BIRADS_MAPPING,
     CALCIFICATION,
     MAMMOGRAPHY,
     MASS,
@@ -100,6 +99,7 @@ class CbisDDSM(BreastCancerDataset):
         self.full_df = pd.concat([calc_desc, mass_desc], ignore_index=True)
 
     def process_info(self):
+        self.report.rows_seen = len(self.full_df)
         self.full_df.drop_duplicates(
             subset=[
                 "patient id",
@@ -114,6 +114,8 @@ class CbisDDSM(BreastCancerDataset):
                 "image file path",
                 "mass shape",
                 "mass margins",
+                "abnormality id",
+                "roi mask file path",
             ],
             inplace=True,
         )
@@ -153,7 +155,7 @@ class CbisDDSM(BreastCancerDataset):
         )
 
         # 5. Drop additional evaluation birads
-        self.full_df = self.full_df[self.full_df["assessment"] != BIRADS_MAPPING[0]]
+        self.full_df = self.full_df[self.full_df["assessment"].notna()]
 
         # 6. Second rename cleaning
         self.full_df = self.full_df.rename(
@@ -165,7 +167,7 @@ class CbisDDSM(BreastCancerDataset):
 
         # Process the exams, splitting on image boundaries so that every row of
         # one image lands in the same worker.
-        self.report.rows_seen = len(self.full_df)
+        self.report.filtered_rows = self.report.rows_seen - len(self.full_df)
 
         image_ids = self.full_df["image file path"].unique()
         n = max(1, cpu_count() - 1)
@@ -226,24 +228,26 @@ class CbisDDSM(BreastCancerDataset):
         groups = list(df.groupby("image file path", sort=False))
 
         with tqdm(
-                total=len(groups),
-                desc="Processing cbis-ddsm batch",
-                unit="image",
-                ncols=100,
-                position=0,
-                leave=True,
+            total=len(groups),
+            desc="Processing cbis-ddsm batch",
+            unit="image",
+            ncols=100,
+            position=0,
+            leave=True,
         ) as pbar:
             for _, group in groups:
                 exam = self.process_image(group)
                 pbar.update(1)
                 if exam is not None:
                     curr_exams.append(exam)
+                else:
+                    self.report.record_drop("image processing failed")
         return curr_exams
 
     @trycatch_func
     def process_image(self, group: pd.DataFrame):
         lead = group.iloc[0]
-        exam_id = str(uuid.uuid4())
+        exam_id = stable_exam_id(self.get_dataset_name(), lead["image file path"])
         patient_id = str(lead["patient id"])
 
         exam_path, img_shape = self.save_slice(
@@ -317,7 +321,7 @@ class CbisDDSM(BreastCancerDataset):
             routed = (
                 get_proper_finding_type(shape_value, MAMMOGRAPHY)
                 if not isna_v2(shape_value)
-                   and get_proper_mass_shape(shape_value) is None
+                and get_proper_mass_shape(shape_value) is None
                 else None
             )
 
@@ -388,7 +392,7 @@ class CbisDDSM(BreastCancerDataset):
     @trycatch_func
     @log_func_info
     def save_segmentation(
-            self, exam_id, patient_id, roi_image_path, img_shape
+        self, exam_id, patient_id, roi_image_path, img_shape
     ) -> str | None:
         base_folder = roi_image_path.split("/")[-2]
         path = os.path.join(

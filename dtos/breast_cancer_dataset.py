@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -30,6 +31,12 @@ ASSESSMENT_SCOPES = (ASSESSMENT_GROUNDED, ASSESSMENT_EXAM_LEVEL, ASSESSMENT_DERI
 def _worker_count() -> int:
     """One core left for the parent, but never fewer than one worker."""
     return max(1, cpu_count() - 1)
+
+
+def stable_exam_id(dataset: str, *source_parts) -> str:
+    return str(
+        uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([dataset, *map(str, source_parts)]))
+    )
 
 
 @dataclass(frozen=True)
@@ -91,6 +98,7 @@ def parse_segmentation_paths(value) -> list[str]:
 class BuildReport:
     dataset: str = ""
     rows_seen: int = 0
+    filtered_rows: int = 0
     exams_kept: int = 0
     drops: Counter = field(default_factory=Counter)
     unmapped: Counter = field(default_factory=Counter)
@@ -102,6 +110,7 @@ class BuildReport:
         if other is None:
             return
         self.rows_seen += other.rows_seen
+        self.filtered_rows += other.filtered_rows
         self.exams_kept += other.exams_kept
         self.drops.update(other.drops)
         self.unmapped.update(other.unmapped)
@@ -114,8 +123,9 @@ class BuildReport:
         lines = [
             f"=== BUILD REPORT: {self.dataset} ===",
             f"  source rows seen : {self.rows_seen:,}",
+            f"  source rows filtered : {self.filtered_rows:,}",
             f"  exams written    : {self.exams_kept:,}",
-            f"  rows dropped     : {dropped:,}",
+            f"  processing units dropped : {dropped:,}",
         ]
         for reason, count in self.drops.most_common():
             lines.append(f"      {count:>8,}  {reason}")
@@ -154,11 +164,11 @@ class BreastCancerDataset(ABC):
             self.append_exam(exam)
 
     def collect_pool_results(self, results) -> None:
-        """Absorb what `pool_worker` returns: (exams, unmapped counts) per batch."""
-        for exams, counts in results:
+        """Absorb exams, unmapped counts, and drop counts from each worker."""
+        for exams, counts, drops in results:
             self.report.absorb_unmapped(counts)
+            self.report.drops.update(drops)
             if exams is None:
-                self.report.record_drop("worker failed")
                 continue
             self.append_exams(exams)
 
@@ -168,6 +178,9 @@ class BreastCancerDataset(ABC):
 
         `worker` must be decorated with `pool_worker`.
         """
+        rows = sum(len(item) if isinstance(item, pd.DataFrame) else 1 for item in items)
+        self.report.rows_seen = self.report.rows_seen or rows
+        self.report.filtered_rows += max(0, self.report.rows_seen - rows)
         with Pool(processes=_worker_count()) as pool:
             results = list(
                 tqdm(
@@ -187,6 +200,8 @@ class BreastCancerDataset(ABC):
         The subclass supplies `process_row(row)`, returning an `ExamInformation`,
         a list of them, or None.
         """
+        self.report.rows_seen = self.report.rows_seen or len(df)
+        self.report.filtered_rows += max(0, self.report.rows_seen - len(df))
         n = _worker_count()
         batches = [
             df.iloc[idx]
@@ -213,15 +228,21 @@ class BreastCancerDataset(ABC):
     def _process_batch(self, df: pd.DataFrame):
         exams = []
         for _, row in tqdm(
-                df.iterrows(),
-                total=len(df),
-                desc=f"Processing {self.get_dataset_name()} batch",
-                unit="exam",
-                ncols=100,
-                leave=True,
+            df.iterrows(),
+            total=len(df),
+            desc=f"Processing {self.get_dataset_name()} batch",
+            unit="exam",
+            ncols=100,
+            leave=True,
         ):
-            result = self.process_row(row)
-            if result is None:
+            try:
+                result = self.process_row(row)
+            except Exception as exc:
+                logger.error(f"Error processing row {row.name}: {exc}")
+                self.report.record_drop("row processing failed")
+                continue
+            if not result:
+                self.report.record_drop("no usable exam")
                 continue
             exams.extend(result if isinstance(result, list) else [result])
         return exams
@@ -239,6 +260,8 @@ class BreastCancerDataset(ABC):
             df.to_parquet(parquet_path, index=False)
         except Exception as exc:
             logger.warning(f"Could not write {parquet_path}: {exc}")
+            if os.path.exists(parquet_path):
+                os.remove(parquet_path)
 
         self.report.absorb_unmapped(drain_unmapped_counts())
         logger.info("\n%s", self.report.render())

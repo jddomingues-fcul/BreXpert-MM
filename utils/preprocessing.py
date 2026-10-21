@@ -91,8 +91,8 @@ def format_unmapped_report(counts, limit: int = 40) -> str:
 
 
 def normalize_to_uint16(
-        img: np.ndarray,
-        value_range: tuple[float, float] | None = None,
+    img: np.ndarray,
+    value_range: tuple[float, float] | None = None,
 ) -> np.ndarray:
     img = np.asarray(img, dtype=np.float32)
 
@@ -169,7 +169,7 @@ def read_mat_images(img_path: str) -> np.ndarray:
 @trycatch_func
 @log_func_info
 def process_us_from_mat(
-        img: np.ndarray, db_threshold: int = -50, axis: int = 0
+    img: np.ndarray, db_threshold: int = -50, axis: int = 0
 ) -> np.ndarray:
     """Envelope-detect and log-compress raw RF ultrasound into a B-mode image.
 
@@ -235,7 +235,7 @@ def resize_mask(mask: np.ndarray, resize_value: tuple) -> np.ndarray:
 
 
 def _letterbox(
-        image: np.ndarray, canvas: tuple[int, int], interpolation: int
+    image: np.ndarray, canvas: tuple[int, int], interpolation: int
 ) -> np.ndarray:
     """Scale to fit inside `canvas` preserving aspect, then centre-pad."""
     if image.ndim != 2:
@@ -399,7 +399,7 @@ def create_segmentation_mask_aux(mask: np.ndarray, rois):
 @trycatch_func
 @log_func_info
 def create_segmentation_mask(
-        height: int, width: int, rois: tuple[tuple[int, int, int, int]]
+    height: int, width: int, rois: tuple[tuple[int, int, int, int]]
 ) -> np.ndarray:
     mask = np.zeros((int(height), int(width)), dtype=np.uint8)
     return create_segmentation_mask_aux(mask, rois)
@@ -681,7 +681,7 @@ def sanitize_string(s: str) -> str:
 @trycatch_func
 @log_func_info
 def draw_rectangle_on_image(
-        image: np.ndarray, x1: int, y1: int, x2: int, y2: int
+    image: np.ndarray, x1: int, y1: int, x2: int, y2: int
 ) -> np.ndarray:
     out = np.array(image, copy=True)
     fill = (
@@ -956,6 +956,9 @@ _NON_SHAPE_SURFACES = {
     "solitary dilated duct",
     "skin lesion",
     "generic",
+    "dilated duct",
+    "multiple dilated ducts",
+    "nme"
 }
 
 
@@ -1057,7 +1060,7 @@ def get_proper_mass_margin(value, modality: str) -> str | None:
         return _most_suspicious(tokens, MARGIN_ORDER[modality])
 
     if modality == MAMMOGRAPHY and _MICROLOBULATED_RE.search(
-            _normalize_for_match(value)
+        _normalize_for_match(value)
     ):
         warn_unmapped(
             "mass margin",
@@ -1080,7 +1083,7 @@ def get_proper_mass_margin(value, modality: str) -> str | None:
 
 
 def migrate_mammography_microlobulated(
-        shape_value, margin_value
+    shape_value, margin_value
 ) -> tuple[str | None, str | None]:
     """Map a legacy mammography (shape, margin) pair onto the v2025 vocabulary.
 
@@ -1200,9 +1203,9 @@ _POSTERIOR_SYNONYMS: dict[str, str | None] = {
     "posterior enhancement": "enhancement",
     "shadowing": "shadowing",
     "posterior shadowing": "shadowing",
-    "combined pattern": "shadowing",
-    "combined": "shadowing",
-    "mixed": "shadowing",
+    "combined pattern": None,
+    "combined": None,
+    "mixed": None,
     "present": None,
 }
 
@@ -1551,7 +1554,7 @@ _ECHOGENIC_SYNONYMS: dict[str, str | None] = {
     "echogenic rind": "echogenic rind",
     "rind": "echogenic rind",
     "thick echogenic band": "echogenic rind",
-    "echogenic halo": "echogenic rind",
+    "echogenic halo": None,
     # A bare halo flag -- including the yes/no columns legacy sheets ship -- says
     # an echogenic boundary is there but not whether it is thin or thick, which
     # is exactly the distinction v2025 introduced. It cannot be resolved.
@@ -1561,7 +1564,6 @@ _ECHOGENIC_SYNONYMS: dict[str, str | None] = {
     "present": None,
     "absent": None,
 }
-
 
 # The 5th edition's "halo" associated feature was REMOVED in v2025 and replaced
 # by two distinct features: echogenic pseudocapsule (a thin, uniform boundary
@@ -1703,8 +1705,8 @@ def collapse_known_biopsy_proven(value):
 def map_birads(value: Any, source: str = "", modality: str = MAMMOGRAPHY) -> str | None:
     """Normalise a source BI-RADS value, applying the project-wide policies.
 
-    Returns None (and logs) for anything unrecognised, so a caller can drop the
-    row rather than inventing an assessment.
+    Returns None for category 0 and logs unrecognised values so a caller can
+    drop the row rather than inventing an assessment. Category 6 folds into 5.
     """
     if isna_v2(value) or value is None:
         return None
@@ -1717,6 +1719,8 @@ def map_birads(value: Any, source: str = "", modality: str = MAMMOGRAPHY) -> str
         )
         return None
 
+    if birads_category_number(mapped) == 0:
+        return None
     return collapse_known_biopsy_proven(mapped)
 
 
@@ -1918,20 +1922,20 @@ def get_proper_location(value, side) -> dict[str, Any]:
             continue
 
         for table, field in (
-                (_SPECIAL_SYNONYMS, "special_location"),
-                (_QUADRANT_SYNONYMS, "quadrant"),
-                (_CARDINAL_SYNONYMS, "coarse_location"),
+            (_SPECIAL_SYNONYMS, "special_location"),
+            (_QUADRANT_SYNONYMS, "quadrant"),
+            (_CARDINAL_SYNONYMS, "coarse_location"),
         ):
             if token in table:
                 out[field] = out[field] or table[token]
                 break
 
     if (
-            out["clock_position"] is None
-            and out["quadrant"] is None
-            and out["special_location"] is None
-            and out["coarse_location"] is None
-            and out["depth"] is None
+        out["clock_position"] is None
+        and out["quadrant"] is None
+        and out["special_location"] is None
+        and out["coarse_location"] is None
+        and out["depth"] is None
     ):
         if unresolved_clock:
             warn_unmapped(

@@ -20,9 +20,9 @@ class ExamContext:
 
 class JSONReportContext:
     def __init__(
-            self,
-            patient_context: PatientContext | None = None,
-            exam_context: ExamContext | None = None,
+        self,
+        patient_context: PatientContext | None = None,
+        exam_context: ExamContext | None = None,
     ) -> None:
         self.patient_context = patient_context
         self.exam_context = exam_context

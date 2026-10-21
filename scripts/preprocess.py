@@ -2,12 +2,11 @@ import logging
 import os
 from argparse import ArgumentParser
 
-from preprocessing.bus_cot import BUSCoT
-
 from dtos.breast_cancer_dataset import BreastCancerDataset
 from preprocessing.advanced_mri_lesions import AdvancedMRILesions
 from preprocessing.breast_lesion_usg import BreastLesionUSG
 from preprocessing.breast_micro_calc import BreastMicroCalc
+from preprocessing.bus_cot import BUSCoT
 from preprocessing.cbis_ddsm import CbisDDSM
 from preprocessing.embed import Embed
 from preprocessing.inbreast import Inbreast

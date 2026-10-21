@@ -205,9 +205,6 @@ class JSONReportFindings:
     annotation_scope: str = SCOPE_UNKNOWN
     assessment: Assessment | None = None
 
-    def __init__(self):
-        self.context = None
-
     def __post_init__(self):
         if self.lesion_status not in LESION_STATUSES:
             raise ValueError(
@@ -225,12 +222,12 @@ class JSONReportFindings:
                 f"{self.lesion_status!r}; a described finding is a present one."
             )
         if (
-                self.lesion_status == LESION_STATUS_ABSENT
-                and self.annotation_scope
-                not in (
+            self.lesion_status == LESION_STATUS_ABSENT
+            and self.annotation_scope
+            not in (
                 SCOPE_COMPLETE,
                 SCOPE_UNKNOWN,
-        )
+            )
         ):
             raise ValueError(
                 "An image with no findings cannot have an index-only annotation scope."
@@ -281,11 +278,11 @@ class JSONReportFindings:
 
     @classmethod
     def build(
-            cls,
-            breast: BreastFindings | None = None,
-            lesion=None,
-            assessment: Assessment | None = None,
-            annotation_scope: str = SCOPE_UNKNOWN,
+        cls,
+        breast: BreastFindings | None = None,
+        lesion=None,
+        assessment: Assessment | None = None,
+        annotation_scope: str = SCOPE_UNKNOWN,
     ) -> JSONReportFindings:
         lesions, status = cls.resolve_lesions(lesion)
         if status != LESION_STATUS_PRESENT:

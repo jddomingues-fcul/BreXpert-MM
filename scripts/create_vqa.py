@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import uuid
 from argparse import ArgumentParser
 from collections import Counter
 from typing import Any, Literal
@@ -151,15 +150,15 @@ class ContextBuilder:
 
 class VQAGenerator:
     def __init__(
-            self,
-            random_seed: int = 42,
-            shuffle_context: bool = False,
-            shuffle_questions: bool = False,
-            context_dropout: float = 0.0,
-            add_negative_examples_prob: float = 0.0,
-            negative_examples_k: int = 0,
-            max_turns: int = 0,
-            multiple_choice_prob: float = 0.0,
+        self,
+        random_seed: int = 42,
+        shuffle_context: bool = False,
+        shuffle_questions: bool = False,
+        context_dropout: float = 0.0,
+        add_negative_examples_prob: float = 0.0,
+        negative_examples_k: int = 0,
+        max_turns: int = 0,
+        multiple_choice_prob: float = 0.0,
     ) -> None:
         self.random_seed = random_seed
         self.shuffle_questions = shuffle_questions
@@ -180,15 +179,15 @@ class VQAGenerator:
 
     # -- turn construction ---------------------------------------------------
     def _ask(
-            self,
-            rng: random.Random,
-            spec,
-            answer: str,
-            modality: str,
-            referent: str | None = None,
-            lesion_id: str | None = None,
-            is_negative: bool = False,
-            negative_case: str | None = None,
+        self,
+        rng: random.Random,
+        spec,
+        answer: str,
+        modality: str,
+        referent: str | None = None,
+        lesion_id: str | None = None,
+        is_negative: bool = False,
+        negative_case: str | None = None,
     ) -> tuple[dict, dict]:
         templates = spec.templates
         if referent == NO_REFERENT and spec.solo_templates:
@@ -198,10 +197,10 @@ class VQAGenerator:
         options = spec.answers_for(modality)
         rendered_options = None
         if (
-                options
-                and not is_negative
-                and self.multiple_choice_prob > 0
-                and rng.random() < self.multiple_choice_prob
+            options
+            and not is_negative
+            and self.multiple_choice_prob > 0
+            and rng.random() < self.multiple_choice_prob
         ):
             shuffled = list(options)
             rng.shuffle(shuffled)
@@ -228,16 +227,16 @@ class VQAGenerator:
         return user_turn, assistant_turn
 
     def _sample_turns(
-            self, rng, findings: dict, modality: str, available_context: set[str]
+        self, rng, findings: dict, modality: str, available_context: set[str]
     ) -> list[tuple[dict, dict]]:
         turns = []
         breast = findings.get("breast") or {}
         lesion_status = findings.get("lesion status", LESION_STATUS_UNKNOWN)
 
         for key, field_id in (
-                ("composition", "breast.composition"),
-                ("fgt", "breast.fgt"),
-                ("tissue composition", "breast.tissue composition"),
+            ("composition", "breast.composition"),
+            ("fgt", "breast.fgt"),
+            ("tissue composition", "breast.tissue composition"),
         ):
             value = breast.get(key)
             if value is None:
@@ -265,9 +264,9 @@ class VQAGenerator:
             spec = self.field_specs_by_id["lesion.count"]
             turns.append(self._ask(rng, spec, "0", modality))
         elif (
-                lesion_status == LESION_STATUS_PRESENT
-                and scope == SCOPE_COMPLETE
-                and lesions
+            lesion_status == LESION_STATUS_PRESENT
+            and scope == SCOPE_COMPLETE
+            and lesions
         ):
             spec = self.field_specs_by_id["lesion.count"]
             turns.append(self._ask(rng, spec, str(len(lesions)), modality))
@@ -289,7 +288,7 @@ class VQAGenerator:
         return all(other.get(key, value) == value for key, value in described.items())
 
     def _referent_or_none(
-            self, referents: Referents, index: int, field_id: str
+        self, referents: Referents, index: int, field_id: str
     ) -> str | None:
         """The shortest referent no other finding in the image also matches."""
         ladders = referents[family_for(field_id)]
@@ -303,13 +302,13 @@ class VQAGenerator:
         return None
 
     def _lesion_turns(
-            self,
-            rng,
-            lesion: dict,
-            referents: Referents,
-            index: int,
-            modality: str,
-            available: set[str],
+        self,
+        rng,
+        lesion: dict,
+        referents: Referents,
+        index: int,
+        modality: str,
+        available: set[str],
     ) -> list[tuple[dict, dict]]:
         turns = []
         lesion_id = lesion.get("lesion id")
@@ -328,11 +327,11 @@ class VQAGenerator:
 
         location = lesion.get("location") or {}
         for key, field_id in (
-                ("laterality", "lesion.location.laterality"),
-                ("quadrant", "lesion.location.quadrant"),
-                ("clock position", "lesion.location.clock position"),
-                ("depth", "lesion.location.depth"),
-                ("special location", "lesion.location.special location"),
+            ("laterality", "lesion.location.laterality"),
+            ("quadrant", "lesion.location.quadrant"),
+            ("clock position", "lesion.location.clock position"),
+            ("depth", "lesion.location.depth"),
+            ("special location", "lesion.location.special location"),
         ):
             value = location.get(key)
             if value is None:
@@ -382,11 +381,8 @@ class VQAGenerator:
             field_specs_by_id=self.field_specs_by_id,
             modality=modality,
             lesion_status=findings.get("lesion status", LESION_STATUS_UNKNOWN),
-            lesion_types=tuple(
-                lesion.get("finding type")
-                for lesion in lesions
-                if lesion.get("finding type")
-            ),
+            lesion_types=tuple(lesion.get("finding type") for lesion in lesions),
+            annotation_scope=findings.get("annotation scope", "unknown"),
         )
         sampled = sample_negative_candidates_one_per_field(
             rng=rng, candidates=candidates, k=self.negative_examples_k
@@ -412,7 +408,7 @@ class VQAGenerator:
 
     # -- entry point ---------------------------------------------------------
     def generate_for_row(
-            self, row: pd.Series, split: Literal["train", "val", "test"]
+        self, row: pd.Series, split: Literal["train", "val", "test"]
     ) -> dict[str, Any]:
         rng = self._rng_for(str(row["id"]))
 
@@ -443,6 +439,7 @@ class VQAGenerator:
         if self.max_turns and len(pairs) > self.max_turns:
             keep_stages = {STAGE_PRESENCE, STAGE_COUNT, STAGE_ASSESSMENT}
             spine = [p for p in pairs if p[1]["stage"] in keep_stages]
+            spine = spine[: self.max_turns]
             rest = [p for p in pairs if p[1]["stage"] not in keep_stages]
             budget = max(0, self.max_turns - len(spine))
             rest = rng.sample(rest, k=min(budget, len(rest)))
@@ -453,9 +450,12 @@ class VQAGenerator:
         assistant_turns = [pair[1] for pair in pairs]
         self.stats["turns"] += len(assistant_turns)
         self.stats["dialogues"] += 1
+        dialogue_hash = hashlib.sha256(
+            json.dumps([context_str, conversation], sort_keys=True).encode()
+        ).hexdigest()[:16]
 
         return {
-            "id": f"{row['id']}_dialogue_{uuid.uuid4()}",
+            "id": f"{row['id']}_dialogue_{split}_{dialogue_hash}",
             "source_id": str(row["id"]),
             "split": split,
             "image_path": str(row["exam"]),
@@ -477,7 +477,7 @@ class VQAGenerator:
 
     @staticmethod
     def _referent_ladder(
-            lesion: dict, exclude: str
+        lesion: dict, exclude: str
     ) -> list[tuple[str, dict[str, str]]]:
         """Ways to refer to one finding, shortest first.
 
